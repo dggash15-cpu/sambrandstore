@@ -1,0 +1,6 @@
+{
+  "name": "Sam Brand Store",
+  "description": "High-performance gaming and precision electronics storefront with admin-managed marketing offers, secure checkout, customer accounts, and role-based employee administration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
