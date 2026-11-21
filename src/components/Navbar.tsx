@@ -12,12 +12,13 @@ import {
   LogOut,
   LayoutDashboard,
 } from 'lucide-react';
-import type { Product } from '../types';
+import type { Product, StoreCategory } from '../types';
 import { ProductVisual } from './ProductVisual';
 import { BrandLogo } from './BrandLogo';
 import { useTranslation } from '../lib/i18n.tsx';
 
 interface NavbarProps {
+  categories: StoreCategory[];
   activeView: 'storefront' | 'admin';
   onNavigateView: (view: 'storefront' | 'admin') => void;
   selectedCategory: string;
@@ -37,15 +38,9 @@ interface NavbarProps {
   onLogout?: () => void;
 }
 
-const NAV_ITEMS: Array<{ label: string; category: string; subtitle: string }> = [
-  { label: 'All Gear', category: 'All', subtitle: 'Complete Sam Brand Store Catalog' },
-  { label: 'Consoles', category: 'Consoles', subtitle: '4K 120Hz Systems & OLED Handhelds' },
-  { label: 'Monitors', category: 'Monitors', subtitle: '240Hz QD-OLED & Curved Ultrawides' },
-  { label: 'Audio', category: 'Audio', subtitle: 'Lossless Wireless & Studio Microphones' },
-  { label: 'Peripherals', category: 'Peripherals', subtitle: 'Hall-Effect Keyboards & 49g Mice' },
-];
 
 export function Navbar({
+  categories,
   activeView,
   onNavigateView,
   selectedCategory,
@@ -122,29 +117,23 @@ export function Navbar({
 
           {/* Zone 2: Clean single-line category links */}
           <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-[#475569]">
-            {NAV_ITEMS.map((item) => {
-              const isActive = activeView === 'storefront' && selectedCategory === item.category;
+            {categories.filter((category) => category.showInMenu).map((category) => {
+              const isActive = activeView === 'storefront' && selectedCategory === category.name;
               return (
                 <div
-                  key={item.category}
-                  onMouseEnter={() =>
-                    setMegaDept(item.category === 'All' ? null : item.category)
-                  }
+                  key={category.id}
                   className="relative py-2"
                 >
                   <button
                     type="button"
-                    onClick={() => handleCategoryClick(item.category)}
+                    onClick={() => handleCategoryClick(category.name)}
                     className={`inline-flex items-center gap-1 whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
                       isActive
                         ? 'text-[#1180E1] font-semibold'
                         : 'text-[#475569] hover:text-[#0F1B2D]'
                     }`}
                   >
-                    <span>{translateCategory(item.category)}</span>
-                    {item.category !== 'All' && (
-                      <ChevronDown className="h-3.5 w-3.5 opacity-55" />
-                    )}
+                    <span>{category.menuLabel || translateCategory(category.name)}</span>
                   </button>
                 </div>
               );
@@ -366,7 +355,7 @@ export function Navbar({
                       {megaDept}
                     </h3>
                     <p className="mt-1.5 text-xs leading-relaxed text-[#6B7A8D]">
-                      {NAV_ITEMS.find((d) => d.category === megaDept)?.subtitle}
+                      {categories.find((category) => category.name === megaDept)?.subtitle || ''}
                     </p>
                   </div>
                   <button
@@ -460,15 +449,7 @@ export function Navbar({
                   </span>
                 </button>
 
-                {[
-                  { id: 'All', label: translateCategory('All') },
-                  { id: 'Consoles', label: translateCategory('Consoles') },
-                  { id: 'Monitors', label: translateCategory('Monitors') },
-                  { id: 'Audio', label: translateCategory('Audio') },
-                  { id: 'Peripherals', label: translateCategory('Peripherals') },
-                  { id: 'Accessories', label: translateCategory('Accessories') },
-                  { id: 'Favorites', label: `${t('nav.favorites')} (${favoritesCount})` },
-                ].map((cat) => {
+                {categories.filter((category) => category.showInMenu).map((category) => ({ id: category.name, label: category.menuLabel || translateCategory(category.name) })).map((cat) => {
                   const active = selectedCategory === cat.id;
                   return (
                     <button

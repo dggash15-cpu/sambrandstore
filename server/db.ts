@@ -1,7 +1,13 @@
-import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  createPool,
+  type Pool,
+  type PoolConnection,
+  type ResultSetHeader,
+  type RowDataPacket,
+} from 'mysql2/promise';
 import type {
   AuditLog,
   CampaignBanner,
@@ -15,15 +21,107 @@ import type {
   Role,
 } from '../src/types.ts';
 
-const rawDbPath = process.env.DB_PATH || path.join('data', 'sam_brand_store.db');
-const dbPath = path.isAbsolute(rawDbPath)
-  ? rawDbPath
-  : path.resolve(process.cwd(), rawDbPath);
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+type SqlValue = string | number | bigint | boolean | Date | Buffer | null;
+type SqlClient = Pool | PoolConnection;
 
-export const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+class DatabaseSession {
+  constructor(private readonly client: SqlClient) {}
+
+  prepare(sql: string) {
+    return {
+      get: async (...params: SqlValue[]): Promise<Record<string, unknown> | undefined> => {
+        const [rows] = await this.client.execute<RowDataPacket[]>(sql, params);
+        return rows[0] as Record<string, unknown> | undefined;
+      },
+      all: async (...params: SqlValue[]): Promise<Array<Record<string, unknown>>> => {
+        const [rows] = await this.client.execute<RowDataPacket[]>(sql, params);
+        return rows as Array<Record<string, unknown>>;
+      },
+      run: async (...params: SqlValue[]): Promise<{ changes: number; insertId: number }> => {
+        const [result] = await this.client.execute<ResultSetHeader>(sql, params);
+        return { changes: result.affectedRows, insertId: result.insertId };
+      },
+    };
+  }
+
+  async exec(sql: string): Promise<void> {
+    await this.client.query(sql);
+  }
+}
+
+function getDatabaseConfig() {
+  let url: URL | undefined;
+  if (process.env.DATABASE_URL) {
+    try {
+      url = new URL(process.env.DATABASE_URL);
+    } catch {
+      throw new Error('DATABASE_URL must be a valid MySQL or MariaDB connection URL.');
+    }
+    if (url.protocol !== 'mysql:' && url.protocol !== 'mariadb:') {
+      throw new Error('DATABASE_URL must use the mysql:// or mariadb:// scheme.');
+    }
+  }
+
+  const host = process.env.DB_HOST || url?.hostname;
+  const user = process.env.DB_USER || (url ? decodeURIComponent(url.username) : '');
+  const password = process.env.DB_PASSWORD || (url ? decodeURIComponent(url.password) : '');
+  const database = process.env.DB_NAME || (url ? decodeURIComponent(url.pathname.slice(1)) : '');
+  const rawPort = process.env.DB_PORT || url?.port || '3306';
+  const port = Number(rawPort);
+
+  if (!host || !user || !password || !database) {
+    throw new Error(
+      'MySQL configuration is incomplete. Set DB_HOST, DB_PORT, DB_USER, DB_NAME, and DB_PASSWORD.'
+    );
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('DB_PORT must be an integer between 1 and 65535.');
+  }
+
+  return { host, user, password, database, port };
+}
+
+const pool = createPool({
+  ...getDatabaseConfig(),
+  charset: 'utf8mb4',
+  connectionLimit: 5,
+  waitForConnections: true,
+  queueLimit: 0,
+  decimalNumbers: true,
+  dateStrings: true,
+  timezone: 'Z',
+});
+
+class MySqlDatabase extends DatabaseSession {
+  constructor(private readonly pool: Pool) {
+    super(pool);
+  }
+
+  async transaction<T>(callback: (tx: DatabaseSession) => Promise<T>): Promise<T> {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const result = await callback(new DatabaseSession(connection));
+      await connection.commit();
+      return result;
+    } catch (error) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Failed to roll back MySQL transaction:', rollbackError);
+      }
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+}
+
+export const db = new MySqlDatabase(pool);
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -40,246 +138,334 @@ export function verifyPassword(password: string, storedHash: string): boolean {
   return crypto.timingSafeEqual(derived, storedBuf);
 }
 
-export function initDatabase(): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS roles (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      slug TEXT NOT NULL UNIQUE,
+async function cleanupDemoData(): Promise<void> {
+  const demoProductIds = [
+    'prod_ps5_cobalt_ltd', 'prod_rog_oled_32', 'prod_studio_dac_amp', 'prod_carbon_desk_mat',
+    'prod_ps5_pro', 'prod_oled_27', 'prod_novapulse_audio', 'prod_tactile75',
+    'prod_aerolite_mouse', 'prod_horizon_handheld', 'prod_dualforce_ctrl', 'prod_ultrawide_34',
+    'prod_hyperdock', 'prod_echocast_mic', 'prod_xbox_galaxy', 'prod_macro_deck',
+  ];
+  for (const id of demoProductIds) {
+    await db.prepare('DELETE FROM product_reviews WHERE product_id = ?').run(id);
+    await db.prepare('DELETE FROM stock_waitlist WHERE product_id = ?').run(id);
+  }
+  await db.prepare("DELETE FROM order_items WHERE order_id LIKE 'ord_seed_%'").run();
+  await db.prepare("DELETE FROM orders WHERE id LIKE 'ord_seed_%'").run();
+  await db.prepare("DELETE FROM audit_logs WHERE id LIKE 'aud_seed_%'").run();
+  await db.prepare("DELETE FROM product_reviews WHERE id LIKE 'rev_seed_%'").run();
+  await db.prepare("DELETE FROM flash_sales WHERE id LIKE 'fs_%'").run();
+  await db.prepare("DELETE FROM campaigns WHERE id LIKE 'cmp_%'").run();
+  await db.prepare("DELETE FROM users WHERE id IN ('usr_maya_mgr','usr_alex_inv','usr_liam_ship')").run();
+  for (const id of demoProductIds) {
+    await db.prepare('DELETE FROM order_items WHERE product_id = ?').run(id);
+    await db.prepare('DELETE FROM products WHERE id = ?').run(id);
+  }
+}
+
+export async function initDatabase(): Promise<void> {
+  const schemaStatements = [
+    `CREATE TABLE IF NOT EXISTS roles (
+      id VARCHAR(191) NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      slug VARCHAR(191) NOT NULL,
       description TEXT NOT NULL,
-      permissions TEXT NOT NULL,
-      max_discount_pct INTEGER NOT NULL DEFAULT 0,
-      max_refund_amount REAL NOT NULL DEFAULT 0,
-      is_system INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      role_id TEXT NOT NULL REFERENCES roles(id),
-      custom_permissions TEXT NOT NULL DEFAULT '[]',
-      department_scope TEXT NOT NULL DEFAULT 'all',
-      status TEXT NOT NULL DEFAULT 'active',
-      created_at TEXT NOT NULL,
-      last_login_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS products (
-      id TEXT PRIMARY KEY,
-      sku TEXT NOT NULL UNIQUE,
-      slug TEXT NOT NULL UNIQUE,
-      name TEXT NOT NULL,
-      brand TEXT NOT NULL,
-      category TEXT NOT NULL,
-      price REAL NOT NULL,
-      compare_at_price REAL,
-      cost_price REAL,
-      stock INTEGER NOT NULL DEFAULT 0,
-      low_stock_threshold INTEGER NOT NULL DEFAULT 5,
-      condition TEXT NOT NULL DEFAULT 'New',
-      warranty TEXT NOT NULL DEFAULT '2-Year Official Sam Brand Warranty',
-      weight TEXT,
-      dimensions TEXT,
-      whats_in_box TEXT NOT NULL DEFAULT '[]',
-      tags TEXT NOT NULL DEFAULT '[]',
-      badge TEXT,
+      permissions LONGTEXT NOT NULL,
+      max_discount_pct INT NOT NULL DEFAULT 0,
+      max_refund_amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+      is_system TINYINT(1) NOT NULL DEFAULT 0,
+      created_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_roles_slug (slug)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS users (
+      id VARCHAR(191) NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(254) NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      role_id VARCHAR(191) NOT NULL,
+      custom_permissions LONGTEXT NOT NULL DEFAULT '[]',
+      department_scope VARCHAR(255) NOT NULL DEFAULT 'all',
+      status VARCHAR(32) NOT NULL DEFAULT 'active',
+      created_at VARCHAR(32) NOT NULL,
+      last_login_at VARCHAR(32) NULL,
+      phone VARCHAR(64) NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_users_email (email),
+      KEY idx_users_role_id (role_id),
+      CONSTRAINT fk_users_role FOREIGN KEY (role_id) REFERENCES roles(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS products (
+      id VARCHAR(191) NOT NULL,
+      sku VARCHAR(64) NOT NULL,
+      slug VARCHAR(191) NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      brand VARCHAR(255) NOT NULL,
+      category VARCHAR(100) NOT NULL,
+      price DECIMAL(14,2) NOT NULL,
+      compare_at_price DECIMAL(14,2) NULL,
+      cost_price DECIMAL(14,2) NULL,
+      stock INT NOT NULL DEFAULT 0,
+      low_stock_threshold INT NOT NULL DEFAULT 5,
+      \`condition\` VARCHAR(32) NOT NULL DEFAULT 'New',
+      warranty VARCHAR(255) NOT NULL DEFAULT '2-Year Official Sam Brand Warranty',
+      weight VARCHAR(128) NULL,
+      dimensions VARCHAR(128) NULL,
+      whats_in_box LONGTEXT NOT NULL DEFAULT '[]',
+      tags LONGTEXT NOT NULL DEFAULT '[]',
+      badge VARCHAR(128) NULL,
       tagline TEXT NOT NULL,
       description TEXT NOT NULL,
-      specs TEXT NOT NULL,
-      variants TEXT NOT NULL,
-      visual_key TEXT NOT NULL,
-      image_url TEXT,
-      images TEXT NOT NULL DEFAULT '[]',
-      featured INTEGER NOT NULL DEFAULT 0,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS password_resets (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      code TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      used INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS orders (
-      id TEXT PRIMARY KEY,
-      order_number TEXT NOT NULL UNIQUE,
-      user_id TEXT REFERENCES users(id),
-      customer_name TEXT NOT NULL,
-      customer_email TEXT NOT NULL,
-      customer_phone TEXT NOT NULL,
+      specs LONGTEXT NOT NULL,
+      variants LONGTEXT NOT NULL,
+      visual_key VARCHAR(128) NOT NULL,
+      image_url TEXT NULL,
+      images LONGTEXT NOT NULL DEFAULT '[]',
+      featured TINYINT(1) NOT NULL DEFAULT 0,
+      active TINYINT(1) NOT NULL DEFAULT 1,
+      created_at VARCHAR(32) NOT NULL,
+      updated_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_products_sku (sku),
+      UNIQUE KEY uq_products_slug (slug),
+      KEY idx_products_category (category),
+      KEY idx_products_active_featured (active, featured)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS store_categories (
+      id VARCHAR(191) NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      slug VARCHAR(100) NOT NULL,
+      subtitle VARCHAR(255) NOT NULL DEFAULT '',
+      image_url TEXT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      active TINYINT(1) NOT NULL DEFAULT 1,
+      created_at VARCHAR(32) NOT NULL,
+      updated_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_store_categories_name (name),
+      UNIQUE KEY uq_store_categories_slug (slug),
+      KEY idx_store_categories_active_sort (active, sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS password_resets (
+      id VARCHAR(191) NOT NULL,
+      user_id VARCHAR(191) NOT NULL,
+      code VARCHAR(64) NOT NULL,
+      expires_at VARCHAR(32) NOT NULL,
+      used TINYINT(1) NOT NULL DEFAULT 0,
+      created_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      KEY idx_password_resets_user_created (user_id, created_at),
+      CONSTRAINT fk_password_resets_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS orders (
+      id VARCHAR(191) NOT NULL,
+      order_number VARCHAR(64) NOT NULL,
+      user_id VARCHAR(191) NULL,
+      customer_name VARCHAR(255) NOT NULL,
+      customer_email VARCHAR(254) NOT NULL,
+      customer_phone VARCHAR(64) NOT NULL,
       shipping_address TEXT NOT NULL,
-      city TEXT NOT NULL,
-      postal_code TEXT NOT NULL,
-      payment_method TEXT NOT NULL,
-      payment_status TEXT NOT NULL,
-      payment_last4 TEXT,
-      transaction_ref TEXT NOT NULL,
-      order_status TEXT NOT NULL,
-      subtotal REAL NOT NULL,
-      shipping_cost REAL NOT NULL,
-      discount_amount REAL NOT NULL,
-      tax_amount REAL NOT NULL,
-      total REAL NOT NULL,
-      promo_code TEXT,
-      notes TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS order_items (
-      id TEXT PRIMARY KEY,
-      order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-      product_id TEXT NOT NULL,
-      product_name TEXT NOT NULL,
-      sku TEXT NOT NULL,
-      variant_label TEXT NOT NULL,
-      quantity INTEGER NOT NULL,
-      unit_price REAL NOT NULL,
-      line_total REAL NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id TEXT PRIMARY KEY,
-      actor_id TEXT NOT NULL,
-      actor_name TEXT NOT NULL,
-      actor_role TEXT NOT NULL,
-      action TEXT NOT NULL,
-      target_type TEXT NOT NULL,
-      target_id TEXT NOT NULL,
-      details TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS store_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS campaigns (
-      id TEXT PRIMARY KEY,
-      placement TEXT NOT NULL,
-      design_theme TEXT NOT NULL,
-      section_size TEXT NOT NULL,
-      offer_tag TEXT NOT NULL,
-      title TEXT NOT NULL,
+      city VARCHAR(128) NOT NULL,
+      postal_code VARCHAR(32) NOT NULL,
+      payment_method VARCHAR(64) NOT NULL,
+      payment_status VARCHAR(64) NOT NULL,
+      payment_last4 VARCHAR(8) NULL,
+      transaction_ref VARCHAR(191) NOT NULL,
+      order_status VARCHAR(64) NOT NULL,
+      subtotal DECIMAL(14,2) NOT NULL,
+      shipping_cost DECIMAL(14,2) NOT NULL,
+      discount_amount DECIMAL(14,2) NOT NULL,
+      tax_amount DECIMAL(14,2) NOT NULL,
+      total DECIMAL(14,2) NOT NULL,
+      promo_code VARCHAR(128) NULL,
+      notes TEXT NULL,
+      created_at VARCHAR(32) NOT NULL,
+      updated_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_orders_order_number (order_number),
+      KEY idx_orders_user_created (user_id, created_at),
+      KEY idx_orders_created_at (created_at),
+      CONSTRAINT fk_orders_user FOREIGN KEY (user_id) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS order_items (
+      id VARCHAR(191) NOT NULL,
+      order_id VARCHAR(191) NOT NULL,
+      product_id VARCHAR(191) NOT NULL,
+      product_name VARCHAR(255) NOT NULL,
+      sku VARCHAR(64) NOT NULL,
+      variant_label VARCHAR(255) NOT NULL,
+      quantity INT NOT NULL,
+      unit_price DECIMAL(14,2) NOT NULL,
+      line_total DECIMAL(14,2) NOT NULL,
+      PRIMARY KEY (id),
+      KEY idx_order_items_order_id (order_id),
+      KEY idx_order_items_product_id (product_id),
+      CONSTRAINT fk_order_items_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS audit_logs (
+      id VARCHAR(191) NOT NULL,
+      actor_id VARCHAR(191) NOT NULL,
+      actor_name VARCHAR(255) NOT NULL,
+      actor_role VARCHAR(128) NOT NULL,
+      action VARCHAR(128) NOT NULL,
+      target_type VARCHAR(128) NOT NULL,
+      target_id VARCHAR(191) NOT NULL,
+      details LONGTEXT NOT NULL,
+      created_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      KEY idx_audit_logs_created_at (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS store_settings (
+      \`key\` VARCHAR(191) NOT NULL,
+      value LONGTEXT NOT NULL,
+      PRIMARY KEY (\`key\`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS campaigns (
+      id VARCHAR(191) NOT NULL,
+      placement VARCHAR(64) NOT NULL,
+      design_theme VARCHAR(64) NOT NULL,
+      section_size VARCHAR(64) NOT NULL,
+      offer_tag VARCHAR(255) NOT NULL,
+      title VARCHAR(255) NOT NULL,
       subtitle TEXT NOT NULL,
-      cta_label TEXT NOT NULL,
-      promo_code TEXT,
-      target_category TEXT NOT NULL,
-      desktop_image_url TEXT,
-      mobile_image_url TEXT,
-      visual_key TEXT NOT NULL,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS flash_sales (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
+      cta_label VARCHAR(255) NOT NULL,
+      promo_code VARCHAR(128) NULL,
+      target_category VARCHAR(100) NOT NULL,
+      desktop_image_url TEXT NULL,
+      mobile_image_url TEXT NULL,
+      visual_key VARCHAR(128) NOT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      active TINYINT(1) NOT NULL DEFAULT 1,
+      created_at VARCHAR(32) NOT NULL,
+      updated_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      KEY idx_campaigns_active_order (active, sort_order, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS flash_sales (
+      id VARCHAR(191) NOT NULL,
+      title VARCHAR(255) NOT NULL,
       subtitle TEXT NOT NULL,
-      badge_label TEXT NOT NULL DEFAULT 'FLASH SALE',
-      target_category TEXT NOT NULL,
-      discount_pct REAL NOT NULL,
-      design_theme TEXT NOT NULL DEFAULT 'crimson',
-      starts_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_by TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS product_reviews (
-      id TEXT PRIMARY KEY,
-      product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-      product_name TEXT NOT NULL,
-      author_name TEXT NOT NULL,
-      author_email TEXT,
-      rating INTEGER NOT NULL,
-      title TEXT NOT NULL,
+      badge_label VARCHAR(128) NOT NULL DEFAULT 'FLASH SALE',
+      target_category VARCHAR(100) NOT NULL,
+      discount_pct DECIMAL(7,4) NOT NULL,
+      design_theme VARCHAR(64) NOT NULL DEFAULT 'crimson',
+      starts_at VARCHAR(32) NOT NULL,
+      expires_at VARCHAR(32) NOT NULL,
+      active TINYINT(1) NOT NULL DEFAULT 1,
+      created_by VARCHAR(255) NOT NULL,
+      created_at VARCHAR(32) NOT NULL,
+      updated_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      KEY idx_flash_sales_active_expiry (active, expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS product_reviews (
+      id VARCHAR(191) NOT NULL,
+      product_id VARCHAR(191) NOT NULL,
+      product_name VARCHAR(255) NOT NULL,
+      author_name VARCHAR(255) NOT NULL,
+      author_email VARCHAR(254) NULL,
+      rating INT NOT NULL,
+      title VARCHAR(255) NOT NULL,
       comment TEXT NOT NULL,
-      verified_purchase INTEGER NOT NULL DEFAULT 0,
-      helpful_count INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_product_reviews_pid ON product_reviews(product_id);
-
-    CREATE TABLE IF NOT EXISTS stock_waitlist (
-      id TEXT PRIMARY KEY,
-      product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-      product_name TEXT NOT NULL,
-      sku TEXT NOT NULL,
-      variant TEXT NOT NULL DEFAULT 'Standard',
-      email TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_stock_waitlist_pid_email ON stock_waitlist(product_id, email);
-  `);
-
-  // Cleanup legacy placeholder customer account from database
-  db.prepare("UPDATE orders SET user_id = NULL WHERE user_id = 'usr_demo_customer'").run();
-  db.prepare("DELETE FROM users WHERE id = 'usr_demo_customer'").run();
-
-  // Safe migration for phone column on existing DBs
-  const userCols = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
-  if (!userCols.some((c) => c.name === 'phone')) {
-    db.exec('ALTER TABLE users ADD COLUMN phone TEXT');
-  }
-
-  // Safe migration for multi-image & advanced product metadata columns on existing DBs
-  const prodCols = db.prepare('PRAGMA table_info(products)').all() as Array<{ name: string }>;
-  const prodMigrations: Array<[string, string]> = [
-    ['images', "ALTER TABLE products ADD COLUMN images TEXT NOT NULL DEFAULT '[]'"],
-    ['cost_price', 'ALTER TABLE products ADD COLUMN cost_price REAL'],
-    ['condition', "ALTER TABLE products ADD COLUMN condition TEXT NOT NULL DEFAULT 'New'"],
-    ['warranty', "ALTER TABLE products ADD COLUMN warranty TEXT NOT NULL DEFAULT '2-Year Official Sam Brand Warranty'"],
-    ['weight', 'ALTER TABLE products ADD COLUMN weight TEXT'],
-    ['dimensions', 'ALTER TABLE products ADD COLUMN dimensions TEXT'],
-    ['whats_in_box', "ALTER TABLE products ADD COLUMN whats_in_box TEXT NOT NULL DEFAULT '[]'"],
-    ['tags', "ALTER TABLE products ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'"],
+      verified_purchase TINYINT(1) NOT NULL DEFAULT 0,
+      helpful_count INT NOT NULL DEFAULT 0,
+      created_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      KEY idx_product_reviews_pid (product_id),
+      CONSTRAINT fk_product_reviews_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+    `CREATE TABLE IF NOT EXISTS stock_waitlist (
+      id VARCHAR(191) NOT NULL,
+      product_id VARCHAR(191) NOT NULL,
+      product_name VARCHAR(255) NOT NULL,
+      sku VARCHAR(64) NOT NULL,
+      variant VARCHAR(255) NOT NULL DEFAULT 'Standard',
+      email VARCHAR(254) NOT NULL,
+      created_at VARCHAR(32) NOT NULL,
+      PRIMARY KEY (id),
+      KEY idx_stock_waitlist_pid_email (product_id, email),
+      CONSTRAINT fk_stock_waitlist_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
   ];
-  for (const [col, sql] of prodMigrations) {
-    if (!prodCols.some((c) => c.name === col)) {
-      db.exec(sql);
-    }
+
+  for (const statement of schemaStatements) {
+    await db.exec(statement);
   }
 
-  db.prepare('INSERT OR IGNORE INTO store_settings (key, value) VALUES (?, ?)').run(
+  const categoryColumns = (await db
+    .prepare(
+      `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'store_categories'`
+    )
+    .all()) as Array<{ COLUMN_NAME: string }>;
+  const existingCategoryColumns = new Set(categoryColumns.map((row) => row.COLUMN_NAME));
+  if (!existingCategoryColumns.has('show_in_menu')) {
+    await db.exec('ALTER TABLE store_categories ADD COLUMN show_in_menu TINYINT(1) NOT NULL DEFAULT 1');
+  }
+  if (!existingCategoryColumns.has('menu_label')) {
+    await db.exec("ALTER TABLE store_categories ADD COLUMN menu_label VARCHAR(100) NOT NULL DEFAULT ''");
+  }
+
+  const resetCodeColumn = (await db
+    .prepare(
+      `SELECT CHARACTER_MAXIMUM_LENGTH as column_length
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'password_resets'
+         AND COLUMN_NAME = 'code'`
+    )
+    .get()) as { column_length: number | string } | undefined;
+  if (resetCodeColumn && Number(resetCodeColumn.column_length) < 64) {
+    await db.exec('ALTER TABLE password_resets MODIFY COLUMN code VARCHAR(64) NOT NULL');
+  }
+  await db
+    .prepare('UPDATE password_resets SET used = 1 WHERE used = 0 AND CHAR_LENGTH(code) = 6')
+    .run();
+
+  await db.prepare('INSERT IGNORE INTO store_settings (`key`, value) VALUES (?, ?)').run(
     'whatsapp_number',
     process.env.STORE_WHATSAPP_NUMBER || '96171972495'
   );
-  db.prepare(
-    "UPDATE store_settings SET value = ? WHERE key = 'whatsapp_number' AND value = '15550192834'"
+  await db.prepare(
+    "UPDATE store_settings SET value = ? WHERE `key` = 'whatsapp_number' AND value = '15550192834'"
   ).run(process.env.STORE_WHATSAPP_NUMBER || '96171972495');
-  db.prepare('INSERT OR IGNORE INTO store_settings (key, value) VALUES (?, ?)').run(
+  await db.prepare('INSERT IGNORE INTO store_settings (`key`, value) VALUES (?, ?)').run(
     'store_name',
     'Sam Brand Store'
   );
 
-  seedInitialData();
-  seedExtendedCatalog();
-  backfillLocalImageAssets();
-  seedHistoricalAnalyticsOrders();
-  seedInitialReviews();
+  await seedInitialData();
+  // Catalog content is owner-managed; demo catalog items are never seeded.
+  await cleanupDemoData();
+  await db.prepare("UPDATE store_categories SET active = 1 WHERE active = 1").run();
+  const existingCategories = (await db
+    .prepare('SELECT DISTINCT category FROM products WHERE active = 1 AND category IS NOT NULL AND category <> ?')
+    .all('')) as Array<{ category: string }>;
+  for (const [index, row] of existingCategories.entries()) {
+    const name = row.category.trim();
+    if (!name) continue;
+    const slug = name
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || `category-${index + 1}`;
+    const id = `cat_${crypto.createHash('md5').update(name).digest('hex').slice(0, 12)}`;
+    const now = new Date().toISOString();
+    await db.prepare(
+      'INSERT IGNORE INTO store_categories (id, name, slug, subtitle, image_url, sort_order, active, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?)'
+    ).run(id, name, slug, '', index, now, now);
+  }
+  await backfillLocalImageAssets();
 
   // Ensure cmp_offer_2 uses dark navy theme so Hall-Effect title & subtitle render in crisp white
-  db.prepare(
+  await db.prepare(
     "UPDATE campaigns SET design_theme = 'navy' WHERE id = 'cmp_offer_2' AND design_theme = 'chalk'"
   ).run();
 }
 
-function seedInitialReviews(): void {
-  const count = (db.prepare('SELECT COUNT(*) as c FROM product_reviews').get() as { c: number }).c;
+async function seedInitialReviews(): Promise<void> {
+  const countRow = await db.prepare('SELECT COUNT(*) as c FROM product_reviews').get();
+  const count = Number(countRow?.c ?? 0);
   if (count > 0) return;
 
   const insert = db.prepare(`
@@ -400,7 +586,7 @@ function seedInitialReviews(): void {
   ];
 
   for (const r of initialReviews) {
-    insert.run(
+    await insert.run(
       r.id,
       r.productId,
       r.productName,
@@ -416,12 +602,12 @@ function seedInitialReviews(): void {
   }
 }
 
-function seedExtendedCatalog(): void {
+async function seedExtendedCatalog(): Promise<void> {
   const now = new Date().toISOString();
   const insertIgnore = db.prepare(`
-    INSERT OR IGNORE INTO products (
+    INSERT IGNORE INTO products (
       id, sku, slug, name, brand, category, price, compare_at_price, cost_price, stock,
-      low_stock_threshold, condition, warranty, weight, dimensions, whats_in_box, tags,
+      low_stock_threshold, \`condition\`, warranty, weight, dimensions, whats_in_box, tags,
       badge, tagline, description, specs, variants, visual_key, image_url, images,
       featured, active, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
@@ -567,7 +753,7 @@ function seedExtendedCatalog(): void {
   ];
 
   for (const p of extraProducts) {
-    insertIgnore.run(
+    await insertIgnore.run(
       p.id,
       p.sku,
       p.slug,
@@ -600,7 +786,7 @@ function seedExtendedCatalog(): void {
   }
 }
 
-function backfillLocalImageAssets(): void {
+async function backfillLocalImageAssets(): Promise<void> {
   const productGalleries: Record<string, string[]> = {
     prod_ps5_pro: [
       '/src/assets/images/console_ps5_pro.jpg',
@@ -690,7 +876,9 @@ function backfillLocalImageAssets(): void {
   );
 
   for (const [id, gallery] of Object.entries(productGalleries)) {
-    const row = selectProd.get(id) as { id: string; image_url: string | null; images: string } | undefined;
+    const row = (await selectProd.get(id)) as
+      | { id: string; image_url: string | null; images: string }
+      | undefined;
     if (!row) continue;
     let existingImages: string[] = [];
     try {
@@ -704,7 +892,11 @@ function backfillLocalImageAssets(): void {
     // Upgrade seeded items with fewer than 3 placeholder gallery angles so every item has multi-image gallery
     if (existingImages.length < 3) {
       const merged = Array.from(new Set([...existingImages, ...gallery])).slice(0, 5);
-      updateProdGallery.run(merged[0] || row.image_url || gallery[0], JSON.stringify(merged), id);
+      await updateProdGallery.run(
+        merged[0] || row.image_url || gallery[0],
+        JSON.stringify(merged),
+        id
+      );
     }
   }
 
@@ -720,16 +912,16 @@ function backfillLocalImageAssets(): void {
     "UPDATE campaigns SET desktop_image_url = COALESCE(NULLIF(desktop_image_url, ''), ?), mobile_image_url = COALESCE(NULLIF(mobile_image_url, ''), ?) WHERE id = ?"
   );
   for (const [id, url] of Object.entries(campaignImages)) {
-    updateCampImg.run(url, url, id);
+    await updateCampImg.run(url, url, id);
   }
 }
 
-function seedHistoricalAnalyticsOrders(): void {
-  const existingHist = db.prepare("SELECT id FROM orders WHERE id = 'ord_hist_1'").get();
+async function seedHistoricalAnalyticsOrders(): Promise<void> {
+  const existingHist = await db.prepare("SELECT id FROM orders WHERE id = 'ord_hist_1'").get();
   if (existingHist) return;
 
   const insertOrder = db.prepare(`
-    INSERT OR IGNORE INTO orders (
+    INSERT IGNORE INTO orders (
       id, order_number, user_id, customer_name, customer_email, customer_phone,
       shipping_address, city, postal_code, payment_method, payment_status,
       payment_last4, transaction_ref, order_status, subtotal, shipping_cost,
@@ -737,7 +929,7 @@ function seedHistoricalAnalyticsOrders(): void {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertItem = db.prepare(`
-    INSERT OR IGNORE INTO order_items (
+    INSERT IGNORE INTO order_items (
       id, order_id, product_id, product_name, sku, variant_label, quantity, unit_price, line_total
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -879,7 +1071,7 @@ function seedHistoricalAnalyticsOrders(): void {
 
   for (const o of historicalOrders) {
     const ts = daysAgo(o.days);
-    insertOrder.run(
+    await insertOrder.run(
       o.id,
       o.orderNumber,
       null,
@@ -905,7 +1097,7 @@ function seedHistoricalAnalyticsOrders(): void {
       ts
     );
     for (const item of o.items) {
-      insertItem.run(
+      await insertItem.run(
         item.id,
         o.id,
         item.productId,
@@ -920,8 +1112,10 @@ function seedHistoricalAnalyticsOrders(): void {
   }
 }
 
-function seedInitialData(): void {
-  const roleCount = (db.prepare('SELECT COUNT(*) as c FROM roles').get() as { c: number }).c;
+async function seedInitialData(): Promise<void> {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const roleCountRow = await db.prepare('SELECT COUNT(*) as c FROM roles').get();
+  const roleCount = Number(roleCountRow?.c ?? 0);
   const now = new Date().toISOString();
 
   if (roleCount === 0) {
@@ -1026,7 +1220,7 @@ function seedInitialData(): void {
     ];
 
     for (const r of seedRoles) {
-      insertRole.run(
+      await insertRole.run(
         r.id,
         r.name,
         r.slug,
@@ -1040,57 +1234,82 @@ function seedInitialData(): void {
     }
   }
 
-  const userCount = (db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number }).c;
+  const userCountRow = await db.prepare('SELECT COUNT(*) as c FROM users').get();
+  const userCount = Number(userCountRow?.c ?? 0);
   if (userCount === 0) {
     const insertUser = db.prepare(`
       INSERT INTO users (id, name, email, password_hash, role_id, custom_permissions, department_scope, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
     `);
+    const isProduction = process.env.NODE_ENV === 'production';
+    const configuredOwnerEmail = process.env.ADMIN_EMAIL?.trim();
+    const ownerEmail = configuredOwnerEmail || 'sam@sambrandstore.com';
+    const ownerPassword = process.env.ADMIN_PASSWORD || 'SamAdmin2026!';
+    const knownDefaultPasswords = [
+      'SamAdmin2026!',
+      'MayaOps2026!',
+      'AlexStock2026!',
+      'LiamShip2026!',
+    ];
 
-    insertUser.run(
+    if (
+      isProduction &&
+      (!configuredOwnerEmail ||
+        ownerPassword.length < 16 ||
+        knownDefaultPasswords.includes(ownerPassword))
+    ) {
+      throw new Error(
+        'Production database initialization requires a configured ADMIN_EMAIL and a unique ADMIN_PASSWORD of at least 16 characters.'
+      );
+    }
+
+    await insertUser.run(
       'usr_sam_owner',
       'Sam Vance',
-      'sam@sambrandstore.com',
-      hashPassword('SamAdmin2026!'),
+      ownerEmail,
+      hashPassword(ownerPassword),
       'role_owner',
       '[]',
       'all',
       now
     );
-    insertUser.run(
-      'usr_maya_mgr',
-      'Maya Lin',
-      'maya.ops@sambrandstore.com',
-      hashPassword('MayaOps2026!'),
-      'role_manager',
-      '[]',
-      'all',
-      now
-    );
-    insertUser.run(
-      'usr_alex_inv',
-      'Alex Rivera',
-      'alex.stock@sambrandstore.com',
-      hashPassword('AlexStock2026!'),
-      'role_inventory',
-      '[]',
-      'Monitors,Peripherals',
-      now
-    );
-    insertUser.run(
-      'usr_liam_ship',
-      'Liam Patel',
-      'liam.ship@sambrandstore.com',
-      hashPassword('LiamShip2026!'),
-      'role_fulfillment',
-      '[]',
-      'all',
-      now
-    );
+    if (false) {
+      await insertUser.run(
+        'usr_maya_mgr',
+        'Maya Lin',
+        'maya.ops@sambrandstore.com',
+        hashPassword('MayaOps2026!'),
+        'role_manager',
+        '[]',
+        'all',
+        now
+      );
+      await insertUser.run(
+        'usr_alex_inv',
+        'Alex Rivera',
+        'alex.stock@sambrandstore.com',
+        hashPassword('AlexStock2026!'),
+        'role_inventory',
+        '[]',
+        'Monitors,Peripherals',
+        now
+      );
+      await insertUser.run(
+        'usr_liam_ship',
+        'Liam Patel',
+        'liam.ship@sambrandstore.com',
+        hashPassword('LiamShip2026!'),
+        'role_fulfillment',
+        '[]',
+        'all',
+        now
+      );
+    }
   }
 
-  const prodCount = (db.prepare('SELECT COUNT(*) as c FROM products').get() as { c: number }).c;
-  if (prodCount === 0) {
+  const prodCountRow = await db.prepare('SELECT COUNT(*) as c FROM products').get();
+  const prodCount = Number(prodCountRow?.c ?? 0);
+  if (false) {
     const insertProd = db.prepare(`
       INSERT INTO products (
         id, sku, slug, name, brand, category, price, compare_at_price, stock,
@@ -1419,7 +1638,7 @@ function seedInitialData(): void {
     };
 
     for (const p of seedProducts) {
-      insertProd.run(
+      await insertProd.run(
         p.id,
         p.sku,
         p.slug,
@@ -1444,8 +1663,9 @@ function seedInitialData(): void {
     }
   }
 
-  const orderCount = (db.prepare('SELECT COUNT(*) as c FROM orders').get() as { c: number }).c;
-  if (orderCount === 0) {
+  const orderCountRow = await db.prepare('SELECT COUNT(*) as c FROM orders').get();
+  const orderCount = Number(orderCountRow?.c ?? 0);
+  if (false) {
     const insertOrder = db.prepare(`
       INSERT INTO orders (
         id, order_number, user_id, customer_name, customer_email, customer_phone,
@@ -1649,7 +1869,7 @@ function seedInitialData(): void {
     ];
 
     for (const o of sampleOrders) {
-      insertOrder.run(
+      await insertOrder.run(
         o.id,
         o.orderNumber,
         o.userId,
@@ -1675,7 +1895,7 @@ function seedInitialData(): void {
         o.createdAt
       );
       for (const item of o.items) {
-        insertItem.run(
+        await insertItem.run(
           item.id,
           o.id,
           item.productId,
@@ -1689,7 +1909,7 @@ function seedInitialData(): void {
       }
     }
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO audit_logs (id, actor_id, actor_name, actor_role, action, target_type, target_id, details, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
@@ -1707,14 +1927,14 @@ function seedInitialData(): void {
 
   // Ensure existing owner & manager roles get campaigns:manage permission on upgrade
   for (const roleId of ['role_owner', 'role_manager']) {
-    const row = db.prepare('SELECT permissions FROM roles WHERE id = ?').get(roleId) as
+    const row = (await db.prepare('SELECT permissions FROM roles WHERE id = ?').get(roleId)) as
       | { permissions: string }
       | undefined;
     if (row) {
       const perms = JSON.parse(row.permissions) as PermissionKey[];
       if (!perms.includes('campaigns:manage')) {
         perms.push('campaigns:manage');
-        db.prepare('UPDATE roles SET permissions = ? WHERE id = ?').run(
+        await db.prepare('UPDATE roles SET permissions = ? WHERE id = ?').run(
           JSON.stringify(perms),
           roleId
         );
@@ -1722,8 +1942,9 @@ function seedInitialData(): void {
     }
   }
 
-  const campaignCount = (db.prepare('SELECT COUNT(*) as c FROM campaigns').get() as { c: number }).c;
-  if (campaignCount === 0) {
+  const campaignCountRow = await db.prepare('SELECT COUNT(*) as c FROM campaigns').get();
+  const campaignCount = Number(campaignCountRow?.c ?? 0);
+  if (false) {
     const insertCampaign = db.prepare(`
       INSERT INTO campaigns (
         id, placement, design_theme, section_size, offer_tag, title, subtitle,
@@ -1818,7 +2039,7 @@ function seedInitialData(): void {
 
     for (const c of seedCampaigns) {
       const img = seedCampaignImageMap[c.id] || null;
-      insertCampaign.run(
+      await insertCampaign.run(
         c.id,
         c.placement,
         c.designTheme,
@@ -1839,18 +2060,22 @@ function seedInitialData(): void {
     }
   }
 
-  const activeFlash = db.prepare('SELECT id FROM flash_sales WHERE active = 1 AND expires_at > ?').get(now);
+  const activeFlash = await db
+    .prepare('SELECT id FROM flash_sales WHERE active = 1 AND expires_at > ?')
+    .get(now);
   if (!activeFlash) {
     const expires = new Date(Date.now() + 48 * 3600_000).toISOString();
-    const existing = db.prepare('SELECT id FROM flash_sales WHERE id = ?').get('fs_monitors_launch');
+    const existing = await db
+      .prepare('SELECT id FROM flash_sales WHERE id = ?')
+      .get('fs_monitors_launch');
     if (existing) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE flash_sales
         SET starts_at = ?, expires_at = ?, active = 1, updated_at = ?
         WHERE id = ?
       `).run(now, expires, now, 'fs_monitors_launch');
     } else {
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO flash_sales (
           id, title, subtitle, badge_label, target_category, discount_pct,
           design_theme, starts_at, expires_at, active, created_by, created_at, updated_at
@@ -2018,7 +2243,7 @@ export function mapAuditRow(row: Record<string, unknown>): AuditLog {
   };
 }
 
-export function logAudit(
+export async function logAudit(
   actorId: string,
   actorName: string,
   actorRole: string,
@@ -2026,8 +2251,8 @@ export function logAudit(
   targetType: string,
   targetId: string,
   details: string
-): void {
-  db.prepare(`
+): Promise<void> {
+  await db.prepare(`
     INSERT INTO audit_logs (id, actor_id, actor_name, actor_role, action, target_type, target_id, details, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -2043,8 +2268,12 @@ export function logAudit(
   );
 }
 
-export function getStoreSettings(): { whatsappNumber: string; storeName: string; logoUrl: string } {
-  const rows = db.prepare('SELECT key, value FROM store_settings').all() as Array<{
+export async function getStoreSettings(): Promise<{
+  whatsappNumber: string;
+  storeName: string;
+  logoUrl: string;
+}> {
+  const rows = (await db.prepare('SELECT `key`, value FROM store_settings').all()) as Array<{
     key: string;
     value: string;
   }>;
@@ -2056,34 +2285,34 @@ export function getStoreSettings(): { whatsappNumber: string; storeName: string;
   };
 }
 
-export function updateStoreSettings(payload: {
+export async function updateStoreSettings(payload: {
   whatsappNumber?: string;
   storeName?: string;
   logoUrl?: string;
-} | string): {
+} | string): Promise<{
   whatsappNumber: string;
   storeName: string;
   logoUrl: string;
-} {
+}> {
   const upsert = db.prepare(
-    'INSERT INTO store_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    'INSERT INTO store_settings (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)'
   );
   if (typeof payload === 'string') {
     const cleaned = payload.replace(/[^\d+]/g, '');
-    upsert.run('whatsapp_number', cleaned);
+    await upsert.run('whatsapp_number', cleaned);
   } else {
     if (payload.whatsappNumber !== undefined) {
       const cleaned = payload.whatsappNumber.replace(/[^\d+]/g, '');
-      upsert.run('whatsapp_number', cleaned);
+      await upsert.run('whatsapp_number', cleaned);
     }
     if (payload.storeName !== undefined) {
-      upsert.run('store_name', payload.storeName.trim());
+      await upsert.run('store_name', payload.storeName.trim());
     }
     if (payload.logoUrl !== undefined) {
-      upsert.run('logo_url', payload.logoUrl.trim());
+      await upsert.run('logo_url', payload.logoUrl.trim());
     }
   }
-  return getStoreSettings();
+  return await getStoreSettings();
 }
 
 export function mapCampaignRow(row: Record<string, unknown>): CampaignBanner {
@@ -2113,14 +2342,7 @@ export function mapFlashSaleRow(row: Record<string, unknown>): FlashSale {
   const designTheme: FlashSaleTheme =
     rawTheme === 'navy' || rawTheme === 'cobalt' || rawTheme === 'obsidian' ? rawTheme : 'crimson';
   const rawCat = String(row.target_category || 'All');
-  const targetCategory: FlashSaleCategory =
-    rawCat === 'Consoles' ||
-    rawCat === 'Monitors' ||
-    rawCat === 'Audio' ||
-    rawCat === 'Peripherals' ||
-    rawCat === 'Accessories'
-      ? rawCat
-      : 'All';
+  const targetCategory: FlashSaleCategory = rawCat || 'All';
 
   return {
     id: String(row.id),

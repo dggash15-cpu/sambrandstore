@@ -285,7 +285,7 @@ export const TRANSLATIONS: Record<Language, Record<string, string>> = {
     'footer.recentlyViewed': 'Recently Viewed',
     'footer.browserHistory': 'Your Browser History',
     'footer.clearLog': 'Clear Log',
-    'footer.techStack': 'Direct WhatsApp Checkout · Fast Node & SQLite Hosting',
+    'footer.techStack': 'Direct WhatsApp Checkout · Fast Node & MySQL Hosting',
 
     // HeroSection extras
     'hero.inspect': 'Inspect',
@@ -707,7 +707,7 @@ export const TRANSLATIONS: Record<Language, Record<string, string>> = {
     'footer.recentlyViewed': 'المُشاهَد مؤخراً',
     'footer.browserHistory': 'سجل تصفحك',
     'footer.clearLog': 'مسح السجل',
-    'footer.techStack': 'دفع مباشر عبر واتساب · استضافة Node وSQLite سريعة',
+    'footer.techStack': 'دفع مباشر عبر واتساب · استضافة Node وMySQL سريعة',
 
     // HeroSection extras
     'hero.inspect': 'معاينة',

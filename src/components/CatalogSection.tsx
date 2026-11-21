@@ -19,12 +19,13 @@ import {
   Share2,
   Zap,
 } from 'lucide-react';
-import type { Product } from '../types';
+import type { Product, StoreCategory } from '../types';
 import { ProductVisual } from './ProductVisual';
 import { useTranslation } from '../lib/i18n.tsx';
 
 interface CatalogSectionProps {
   products: Product[];
+  categories: StoreCategory[];
   selectedCategory: string;
   onSelectCategory: (category: string) => void;
   onSelectProduct: (product: Product) => void;
@@ -40,88 +41,6 @@ interface CatalogSectionProps {
   onShareFavorites?: () => string;
 }
 
-const CATEGORIES = [
-  'All',
-  'Consoles',
-  'Monitors',
-  'Audio',
-  'Peripherals',
-  'Accessories',
-  'Featured',
-  'Deals',
-  'Favorites',
-];
-
-const DEPARTMENT_SECTIONS: Array<{
-  key: string;
-  title: string;
-  subtitle: string;
-  categoryTarget: string;
-}> = [
-  {
-    key: 'Featured',
-    title: 'Featured Drops',
-    subtitle: 'Flagship builds and limited-run hardware curated by Sam Brand.',
-    categoryTarget: 'Featured',
-  },
-  {
-    key: 'Consoles',
-    title: 'Consoles & Handhelds',
-    subtitle: 'Next-gen 4K living-room rigs and OLED portable systems.',
-    categoryTarget: 'Consoles',
-  },
-  {
-    key: 'Monitors',
-    title: 'OLED & Esports Monitors',
-    subtitle: 'High-refresh QD-OLED panels with zero-blur response.',
-    categoryTarget: 'Monitors',
-  },
-  {
-    key: 'Audio',
-    title: 'Studio Audio & Acoustics',
-    subtitle: 'Planar magnetic headsets, DACs, and broadcast condenser mics.',
-    categoryTarget: 'Audio',
-  },
-  {
-    key: 'Peripherals',
-    title: 'Precision Peripherals',
-    subtitle: 'Hall-effect keyboards, carbon mice, and tournament controllers.',
-    categoryTarget: 'Peripherals',
-  },
-  {
-    key: 'Accessories',
-    title: 'Docks, Cables & Desk Gear',
-    subtitle: 'Thunderbolt hubs, studio mats, and workstation power.',
-    categoryTarget: 'Accessories',
-  },
-];
-
-const DEPT_TRANSLATIONS: Record<string, { title: string; subtitle: string }> = {
-  Featured: {
-    title: 'إصدارات مختارة',
-    subtitle: 'أحدث الأجهزة وقطع العتاد المحدودة بإشراف سام ستور.',
-  },
-  Consoles: {
-    title: 'منصات الألعاب والمحمولة',
-    subtitle: 'منصات 4K فائقة القوة وأجهزة ألعاب OLED محمولة.',
-  },
-  Monitors: {
-    title: 'شاشات أوليد ورياضات إلكترونية',
-    subtitle: 'شاشات QD-OLED سريعة الاستجابة وبمعدل تحديث فائق النعومة.',
-  },
-  Audio: {
-    title: 'صوتيات الاستوديو الاحترافية',
-    subtitle: 'سماعات مغناطيسية مستوية ومحولات رقمية وميكروفونات بث.',
-  },
-  Peripherals: {
-    title: 'الملحقات الدقيقة والتحكم',
-    subtitle: 'لوحات مفاتيح هول-إيفكت، فارات كربونية خفيفة، وأذرع تحكم بطولات.',
-  },
-  Accessories: {
-    title: 'القواعد والكابلات ومعدات المكتب',
-    subtitle: 'قواعد ثندربولت، أسطح مكاتب مريحة، وحلول طاقة متكاملة.',
-  },
-};
 
 function useResponsivePerSlide() {
   const [perSlide, setPerSlide] = useState(5);
@@ -648,6 +567,7 @@ function ProductSlideSection({
 
 export function CatalogSection({
   products,
+  categories,
   selectedCategory,
   onSelectCategory,
   onSelectProduct,
@@ -697,17 +617,19 @@ export function CatalogSection({
   };
 
   const activeProducts = useMemo(() => products.filter((p) => p.active), [products]);
+  const selectedCategorySlug = categories.find((category) => category.name === selectedCategory)?.slug
+    || (selectedCategory === 'All' ? 'all' : selectedCategory);
 
   const filtered = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const list = activeProducts.filter((p) => {
-      if (selectedCategory === 'Featured') {
+      if (selectedCategorySlug === 'featured-picks' || selectedCategorySlug === 'flagship-picks' || selectedCategory === 'Featured') {
         if (!p.featured) return false;
-      } else if (selectedCategory === 'Deals') {
+      } else if (selectedCategorySlug === 'special-offers' || selectedCategory === 'Deals') {
         if (!(p.compareAtPrice && p.compareAtPrice > p.price)) return false;
-      } else if (selectedCategory === 'Favorites') {
+      } else if (selectedCategorySlug === 'saved-gear' || selectedCategory === 'Favorites') {
         if (!favorites.includes(p.id)) return false;
-      } else if (selectedCategory !== 'All' && p.category !== selectedCategory) {
+      } else if (selectedCategorySlug !== 'all' && selectedCategory !== 'All' && p.category !== selectedCategory) {
         return false;
       }
       if (q) {
@@ -723,19 +645,19 @@ export function CatalogSection({
     });
 
     return sortItems(list);
-  }, [activeProducts, selectedCategory, favorites, searchQuery, sortBy]);
+  }, [activeProducts, selectedCategory, selectedCategorySlug, favorites, searchQuery, sortBy]);
 
   // Build per-department slide sections when viewing "All" without search filter
   const sectionDecks = useMemo(() => {
-    if (selectedCategory !== 'All' || searchQuery.trim()) return [];
-    return DEPARTMENT_SECTIONS.map((sec) => {
-      const items =
-        sec.key === 'Featured'
-          ? sortItems(activeProducts.filter((p) => p.featured))
-          : sortItems(activeProducts.filter((p) => p.category === sec.key));
-      return { ...sec, items };
-    }).filter((sec) => sec.items.length > 0);
-  }, [activeProducts, selectedCategory, searchQuery, sortBy]);
+    if (selectedCategorySlug !== 'all' && selectedCategory !== 'All' || searchQuery.trim()) return [];
+    return categories.map((category) => ({
+      key: category.id,
+      title: category.name,
+      subtitle: category.subtitle,
+      categoryTarget: category.name,
+      items: sortItems(activeProducts.filter((p) => p.category === category.name)),
+    })).filter((sec) => sec.items.length > 0);
+  }, [activeProducts, categories, selectedCategory, searchQuery, sortBy]);
 
   const compareProducts = useMemo(
     () =>
@@ -755,7 +677,7 @@ export function CatalogSection({
     }, 1100);
   };
 
-  const showSectionSlides = selectedCategory === 'All' && !searchQuery.trim();
+  const showSectionSlides = (selectedCategorySlug === 'all' || selectedCategory === 'All') && !searchQuery.trim();
 
   return (
     <section id="catalog-section" className="mx-auto max-w-7xl px-3 py-6 sm:px-6 lg:px-8 lg:py-9">
@@ -763,13 +685,14 @@ export function CatalogSection({
       <div className="flex flex-col gap-2.5 border-b border-[#E6ECF4] pb-3.5 lg:flex-row lg:items-center lg:justify-between">
         <div className="overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           <div className="inline-flex items-center gap-1 rounded-xl border border-[#E6ECF4] bg-[#F7FAFD] p-1">
-            {CATEGORIES.map((category) => {
-              const active = selectedCategory === category;
+            {categories.map((category) => {
+              const categoryName = category.name;
+              const active = selectedCategory === categoryName;
               return (
                 <button
-                  key={category}
+                  key={category.id}
                   type="button"
-                  onClick={() => onSelectCategory(category)}
+                  onClick={() => onSelectCategory(categoryName)}
                   className={`relative rounded-lg px-2.5 py-1.5 text-[11px] sm:text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                     active ? 'text-[#0F1B2D]' : 'text-[#6B7A8D] hover:text-[#0F1B2D]'
                   }`}
@@ -782,10 +705,7 @@ export function CatalogSection({
                     />
                   )}
                   <span className="relative z-10 inline-flex items-center gap-1">
-                    {category === 'Favorites' && (
-                      <Heart className="h-3 w-3 text-[#EF4444] fill-[#EF4444]" />
-                    )}
-                    <span>{translateCategory(category)}</span>
+                    <span>{translateCategory(categoryName)}</span>
                   </span>
                 </button>
               );
@@ -823,7 +743,7 @@ export function CatalogSection({
             <ChevronDown className={`pointer-events-none absolute ${isRtl ? 'left-2' : 'right-2'} h-3.5 w-3.5 text-[#6B7A8D]`} />
           </div>
 
-          {selectedCategory === 'Favorites' && favorites.length > 0 && onShareFavorites && (
+          {(selectedCategorySlug === 'saved-gear' || selectedCategory === 'Favorites') && favorites.length > 0 && onShareFavorites && (
             <button
               type="button"
               onClick={async () => {
@@ -855,8 +775,8 @@ export function CatalogSection({
           {sectionDecks.map((sec) => (
             <ProductSlideSection
               key={sec.key}
-              title={lang === 'ar' ? DEPT_TRANSLATIONS[sec.key]?.title || sec.title : sec.title}
-              subtitle={lang === 'ar' ? DEPT_TRANSLATIONS[sec.key]?.subtitle || sec.subtitle : sec.subtitle}
+              title={sec.title}
+              subtitle={sec.subtitle}
               items={sec.items}
               perSlide={perSlide}
               sortKey={sortBy}

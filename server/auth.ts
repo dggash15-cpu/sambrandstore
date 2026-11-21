@@ -43,8 +43,8 @@ export function verifySessionToken(token: string): { uid: string; exp: number } 
   }
 }
 
-export function loadUserById(userId: string): AuthUser | null {
-  const row = db
+export async function loadUserById(userId: string): Promise<AuthUser | null> {
+  const row = (await db
     .prepare(
       `
       SELECT
@@ -57,7 +57,7 @@ export function loadUserById(userId: string): AuthUser | null {
       WHERE u.id = ?
     `
     )
-    .get(userId) as Record<string, unknown> | undefined;
+    .get(userId)) as Record<string, unknown> | undefined;
 
   if (!row) return null;
 
@@ -101,16 +101,16 @@ function extractToken(req: Request): string | null {
   return null;
 }
 
-export function attachOptionalUser(
+export async function attachOptionalUser(
   req: AuthenticatedRequest,
   _res: Response,
   next: NextFunction
-): void {
+): Promise<void> {
   const token = extractToken(req);
   if (token) {
     const verified = verifySessionToken(token);
     if (verified) {
-      const user = loadUserById(verified.uid);
+      const user = await loadUserById(verified.uid);
       if (user && user.status === 'active') {
         req.authUser = user;
       }

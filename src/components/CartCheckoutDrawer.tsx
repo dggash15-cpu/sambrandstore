@@ -5,9 +5,7 @@ import {
   Minus,
   Plus,
   Trash2,
-  CreditCard,
   Banknote,
-  Smartphone,
   ShieldCheck,
   ArrowLeft,
   CheckCircle2,
@@ -24,7 +22,7 @@ import {
   buildWhatsAppUrl,
   downloadOrderInvoiceImage,
 } from '../lib/invoice';
-import type { AuthUser, CartItem, Order, PaymentMethod } from '../types';
+import type { AuthUser, CartItem, Order } from '../types';
 import { useTranslation } from '../lib/i18n';
 import { ProductVisual } from './ProductVisual';
 
@@ -38,18 +36,6 @@ interface CartCheckoutDrawerProps {
   onOrderCompleted: (order: Order) => void;
   user: AuthUser | null;
   initialPromoCode?: string | null;
-}
-
-function detectCardBrand(digits: string): string {
-  if (/^4/.test(digits)) return 'Visa';
-  if (/^5[1-5]/.test(digits) || /^2[2-7]/.test(digits)) return 'Mastercard';
-  if (/^3[47]/.test(digits)) return 'Amex';
-  return 'Card';
-}
-
-function formatCardInput(raw: string): string {
-  const digits = raw.replace(/\D/g, '').slice(0, 16);
-  return digits.replace(/(\d{4})(?=\d)/g, '$1 ');
 }
 
 export function CartCheckoutDrawer({
@@ -81,12 +67,8 @@ export function CartCheckoutDrawer({
   const [customerPhone, setCustomerPhone] = useState('');
   const [shippingAddress, setShippingAddress] = useState('');
   const [city, setCity] = useState('');
-  const [postalCode, setPostalCode] = useState('');
   const [deliveryNotes, setDeliveryNotes] = useState('');
-  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('card');
-  const [cardNumber, setCardNumber] = useState('');
-  const [cardExpiry, setCardExpiry] = useState('');
-  const [cardCvc, setCardCvc] = useState('');
+  const paymentMethod = 'cod';
   const [submitting, setSubmitting] = useState(false);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const [confirmedOrder, setConfirmedOrder] = useState<Order | null>(null);
@@ -151,11 +133,7 @@ export function CartCheckoutDrawer({
         customerPhone,
         shippingAddress,
         city,
-        postalCode,
         paymentMethod,
-        cardNumber: paymentMethod === 'card' ? cardNumber : undefined,
-        cardExpiry: paymentMethod === 'card' ? cardExpiry : undefined,
-        cardCvc: paymentMethod === 'card' ? cardCvc : undefined,
         promoCode: appliedPromo?.code,
         notes: deliveryNotes.trim() || undefined,
         items: items.map((i) => ({
@@ -435,10 +413,9 @@ export function CartCheckoutDrawer({
                       </div>
                       <div>
                         <label className="block text-xs font-medium text-[#475569]">
-                          {t('cart.emailLabel')}
+                          {t('cart.emailLabel')} <span className="font-normal text-[#94A3B8]">(Optional)</span>
                         </label>
                         <input
-                          required
                           type="email"
                           value={customerEmail}
                           onChange={(e) => setCustomerEmail(e.target.value)}
@@ -476,31 +453,16 @@ export function CartCheckoutDrawer({
                       />
                     </div>
 
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs font-medium text-[#475569]">{t('cart.cityLabel')}</label>
-                        <input
-                          required
-                          type="text"
-                          value={city}
-                          onChange={(e) => setCity(e.target.value)}
-                          placeholder="San Francisco"
-                          className="mt-1 w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm focus:border-[#1180E1] focus:outline-none"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium text-[#475569]">
-                          {t('cart.postalCodeLabel')}
-                        </label>
-                        <input
-                          required
-                          type="text"
-                          value={postalCode}
-                          onChange={(e) => setPostalCode(e.target.value)}
-                          placeholder="94103"
-                          className="mt-1 w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm focus:border-[#1180E1] focus:outline-none"
-                        />
-                      </div>
+                    <div>
+                      <label className="block text-xs font-medium text-[#475569]">{t('cart.cityLabel')}</label>
+                      <input
+                        required
+                        type="text"
+                        value={city}
+                        onChange={(e) => setCity(e.target.value)}
+                        placeholder="San Francisco"
+                        className="mt-1 w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm focus:border-[#1180E1] focus:outline-none"
+                      />
                     </div>
 
                     <div>
@@ -523,138 +485,13 @@ export function CartCheckoutDrawer({
                       {t('cart.step2Title')}
                     </h3>
 
-                    <div className="grid grid-cols-3 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setPaymentMethod('card')}
-                        className={`flex flex-col items-center gap-1.5 rounded-xl border p-3 text-xs font-semibold transition-colors cursor-pointer ${
-                          paymentMethod === 'card'
-                            ? 'border-[#1180E1] bg-[#1180E1]/8 text-[#1180E1]'
-                            : 'border-[#D4DFEE] text-[#475569] hover:border-[#0F1B2D]'
-                        }`}
-                      >
-                        <CreditCard className="h-4 w-4" />
-                        <span>{t('cart.payCard')}</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => setPaymentMethod('wallet')}
-                        className={`flex flex-col items-center gap-1.5 rounded-xl border p-3 text-xs font-semibold transition-colors cursor-pointer ${
-                          paymentMethod === 'wallet'
-                            ? 'border-[#1180E1] bg-[#1180E1]/8 text-[#1180E1]'
-                            : 'border-[#D4DFEE] text-[#475569] hover:border-[#0F1B2D]'
-                        }`}
-                      >
-                        <Smartphone className="h-4 w-4" />
-                        <span>{t('cart.payWallet')}</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => setPaymentMethod('cod')}
-                        className={`flex flex-col items-center gap-1.5 rounded-xl border p-3 text-xs font-semibold transition-colors cursor-pointer ${
-                          paymentMethod === 'cod'
-                            ? 'border-[#1180E1] bg-[#1180E1]/8 text-[#1180E1]'
-                            : 'border-[#D4DFEE] text-[#475569] hover:border-[#0F1B2D]'
-                        }`}
-                      >
-                        <Banknote className="h-4 w-4" />
-                        <span>{t('cart.payCod')}</span>
-                      </button>
+                    <div className="flex items-start gap-3 rounded-xl border border-[#1180E1]/30 bg-[#1180E1]/5 p-4 text-xs text-[#475569]">
+                      <Banknote className="mt-0.5 h-4 w-4 shrink-0 text-[#1180E1]" />
+                      <div>
+                        <p className="font-semibold text-[#0F1B2D]">{t('cart.codTitle')}</p>
+                        <p className="mt-1">{t('cart.codDesc')}</p>
+                      </div>
                     </div>
-
-                    {paymentMethod === 'card' && (
-                      <div className="space-y-3 rounded-xl border border-[#E6ECF4] bg-[#F7FAFD] p-4">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="font-semibold text-[#0F1B2D]">
-                            {detectCardBrand(cardNumber.replace(/\D/g, ''))} · Tokenized Checkout
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setCardNumber('4242 4242 4242 4242');
-                              setCardExpiry('08/29');
-                              setCardCvc('424');
-                            }}
-                            className="font-medium text-[#1180E1] hover:underline cursor-pointer"
-                          >
-                            {t('cart.fillTestVisa')}
-                          </button>
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-medium text-[#475569]">
-                            {t('cart.cardNumber')}
-                          </label>
-                          <input
-                            required
-                            type="text"
-                            inputMode="numeric"
-                            value={cardNumber}
-                            onChange={(e) => setCardNumber(formatCardInput(e.target.value))}
-                            placeholder="4242 4242 4242 4242"
-                            className="mt-1 w-full rounded-lg border border-[#D4DFEE] bg-white px-3 py-2 font-mono text-sm focus:border-[#1180E1] focus:outline-none"
-                          />
-                        </div>
-
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <label className="block text-xs font-medium text-[#475569]">
-                              {t('cart.cardExpiry')}
-                            </label>
-                            <input
-                              required
-                              type="text"
-                              maxLength={5}
-                              value={cardExpiry}
-                              onChange={(e) => {
-                                const v = e.target.value.replace(/\D/g, '').slice(0, 4);
-                                setCardExpiry(v.length > 2 ? `${v.slice(0, 2)}/${v.slice(2)}` : v);
-                              }}
-                              placeholder="08/29"
-                              className="mt-1 w-full rounded-lg border border-[#D4DFEE] bg-white px-3 py-2 font-mono text-sm focus:border-[#1180E1] focus:outline-none"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-xs font-medium text-[#475569]">
-                              {t('cart.cardCvc')}
-                            </label>
-                            <input
-                              required
-                              type="password"
-                              maxLength={4}
-                              value={cardCvc}
-                              onChange={(e) => setCardCvc(e.target.value.replace(/\D/g, ''))}
-                              placeholder="424"
-                              className="mt-1 w-full rounded-lg border border-[#D4DFEE] bg-white px-3 py-2 font-mono text-sm focus:border-[#1180E1] focus:outline-none"
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {paymentMethod === 'wallet' && (
-                      <div className="rounded-xl border border-[#E6ECF4] bg-[#F7FAFD] p-4 text-xs text-[#475569]">
-                        <p className="font-semibold text-[#0F1B2D]">
-                          {t('cart.walletTitle')}
-                        </p>
-                        <p className="mt-1">
-                          {t('cart.walletDesc')}
-                        </p>
-                      </div>
-                    )}
-
-                    {paymentMethod === 'cod' && (
-                      <div className="rounded-xl border border-[#E6ECF4] bg-[#F7FAFD] p-4 text-xs text-[#475569]">
-                        <p className="font-semibold text-[#0F1B2D]">
-                          {t('cart.codTitle')}
-                        </p>
-                        <p className="mt-1">
-                          {t('cart.codDesc')}
-                        </p>
-                      </div>
-                    )}
                   </div>
                 </form>
               )}
@@ -855,7 +692,6 @@ export function CartCheckoutDrawer({
                       <p className="text-[#475569]">{t('cart.emailLabelInv')} {confirmedOrder.customerEmail}</p>
                       <p className="text-[#475569]">
                         {t('cart.locationLabel')} {confirmedOrder.shippingAddress}, {confirmedOrder.city}{' '}
-                        {confirmedOrder.postalCode}
                       </p>
                       {confirmedOrder.notes && (
                         <p className="text-[#475569]">{t('cart.notesLabelInv')} {confirmedOrder.notes}</p>

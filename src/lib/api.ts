@@ -12,6 +12,7 @@ import type {
   ProductReview,
   RestockNotification,
   Role,
+  StoreCategory,
 } from '../types';
 
 const TOKEN_STORAGE_KEY = 'sbs_auth_token';
@@ -75,13 +76,10 @@ export const api = {
     setStoredToken(null);
   },
   requestPasswordReset: (email: string) =>
-    request<{ ok: boolean; message: string; demoVerificationCode?: string }>(
-      '/api/auth/request-reset',
-      {
-        method: 'POST',
-        body: JSON.stringify({ email }),
-      }
-    ),
+    request<{ ok: boolean; message: string }>('/api/auth/request-reset', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
   resetPassword: (payload: {
     email?: string;
     currentPassword?: string;
@@ -101,6 +99,22 @@ export const api = {
     const qs = params.toString();
     return request<{ products: Product[] }>(`/api/products${qs ? `?${qs}` : ''}`);
   },
+
+  getCategories: () => request<{ categories: StoreCategory[] }>('/api/categories'),
+  getAdminCategories: () =>
+    request<{ categories: StoreCategory[] }>('/api/admin/categories'),
+  createCategory: (payload: Partial<StoreCategory>) =>
+    request<{ category: StoreCategory }>('/api/admin/categories', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateCategory: (id: string, payload: Partial<StoreCategory>) =>
+    request<{ category: StoreCategory }>(`/api/admin/categories/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  deleteCategory: (id: string) =>
+    request<{ ok: boolean }>(`/api/admin/categories/${id}`, { method: 'DELETE' }),
 
   getCampaigns: () => request<{ campaigns: CampaignBanner[] }>('/api/campaigns'),
 
@@ -165,11 +179,11 @@ export const api = {
 
   createOrder: (payload: {
     customerName: string;
-    customerEmail: string;
+    customerEmail?: string;
     customerPhone: string;
     shippingAddress: string;
     city: string;
-    postalCode: string;
+    postalCode?: string;
     paymentMethod: PaymentMethod;
     cardNumber?: string;
     cardExpiry?: string;

@@ -1,5 +1,4 @@
 import { spawn, type ChildProcess } from 'child_process';
-import { db, initDatabase } from './server/db.ts';
 
 const TEST_PORT = 3980;
 const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
@@ -24,21 +23,38 @@ async function runE2ETestSuite() {
   console.log('🚀 SAM BRAND STORE - COMPLETE END-TO-END TEST SUITE');
   console.log('====================================================\n');
 
-  initDatabase();
+  const testDatabaseName = process.env.TEST_DB_NAME || '';
+  if (!/(?:^|[_-])(?:test|e2e)$/i.test(testDatabaseName)) {
+    throw new Error('Set TEST_DB_NAME to a dedicated database ending in _test or _e2e.');
+  }
+  for (const key of ['TEST_DB_HOST', 'TEST_DB_USER', 'TEST_DB_PASSWORD'] as const) {
+    if (!process.env[key]) {
+      throw new Error(`Missing ${key}; E2E tests require an isolated MySQL test database.`);
+    }
+  }
+  process.env.DB_HOST = process.env.TEST_DB_HOST;
+  process.env.DB_PORT = process.env.TEST_DB_PORT || '3306';
+  process.env.DB_USER = process.env.TEST_DB_USER;
+  process.env.DB_PASSWORD = process.env.TEST_DB_PASSWORD;
+  process.env.DB_NAME = testDatabaseName;
+  process.env.NODE_ENV = 'test';
 
-  // 1. Direct SQLite Database Checks
+  const { db, initDatabase } = await import('./server/db.ts');
+  await initDatabase();
+
+  // 1. Isolated MySQL test database checks
   console.log('--- 1. DATABASE & PERSISTENCE INTEGRITY ---');
   try {
-    const demoCustomer = db.prepare("SELECT * FROM users WHERE id = 'usr_demo_customer' OR email = 'jordan@example.com'").get();
+    const demoCustomer = await db.prepare("SELECT * FROM users WHERE id = 'usr_demo_customer' OR email = 'jordan@example.com'").get();
     record('Placeholder Account Removed', !demoCustomer, demoCustomer ? 'Still present' : 'Verified completely deleted from users');
 
-    const activeStaff = db.prepare('SELECT id, email, role_id FROM users').all() as Array<{ id: string; email: string; role_id: string }>;
+    const activeStaff = await db.prepare('SELECT id, email, role_id FROM users').all() as Array<{ id: string; email: string; role_id: string }>;
     record('Active Staff Users Count', activeStaff.length === 4, `Found ${activeStaff.length} staff: ${activeStaff.map(s => s.email).join(', ')}`);
 
-    const reviewsCount = (db.prepare('SELECT count(*) as c FROM product_reviews').get() as { c: number }).c;
-    record('Persistent Product Reviews Table', reviewsCount >= 9, `Found ${reviewsCount} persistent reviews in SQLite`);
+    const reviewsCount = Number(((await db.prepare('SELECT count(*) as c FROM product_reviews').get()) as { c: number }).c);
+    record('Persistent Product Reviews Table', reviewsCount >= 9, `Found ${reviewsCount} persistent reviews in MySQL`);
 
-    const waitlistCount = (db.prepare('SELECT count(*) as c FROM stock_waitlist').get() as { c: number }).c;
+    const waitlistCount = Number(((await db.prepare('SELECT count(*) as c FROM stock_waitlist').get()) as { c: number }).c);
     record('Persistent Stock Waitlist Table', waitlistCount >= 0, `Table exists and queryable (${waitlistCount} initial rows)`);
   } catch (err) {
     record('Database Schema Check', false, undefined, (err as Error).message);
@@ -55,6 +71,14 @@ async function runE2ETestSuite() {
         NODE_ENV: 'production',
         PORT: String(TEST_PORT),
         SESSION_SECRET: 'production-e2e-secret-key-32-chars-long-valid',
+        ADMIN_EMAIL: 'sam@sambrandstore.com',
+        ADMIN_PASSWORD: 'SamAdmin2026!',
+        SMTP_HOST: '127.0.0.1',
+        SMTP_PORT: '1',
+        SMTP_SECURE: 'true',
+        SMTP_USER: 'e2e@example.invalid',
+        SMTP_PASS: 'e2e-only-password',
+        MAIL_FROM: 'e2e@example.invalid',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -83,8 +107,69 @@ async function runE2ETestSuite() {
 
     // Test Public Store Settings
     const settingsRes = await fetch(`${BASE_URL}/api/settings/public`);
-    const settingsJson = await settingsRes.json() as Record<string, string>;
-    record('Public Store Settings (/api/settings/public)', settingsRes.status === 200, `WhatsApp: ${settingsJson.whatsapp_number}`);
+    const settingsJson = await settingsRes.json() as { whatsappNumber?: string };
+    record(
+      'Public Store Settings (/api/settings/public)',
+      settingsRes.status === 200 && Boolean(settingsJson.whatsappNumber),
+      `WhatsApp configured: ${Boolean(settingsJson.whatsappNumber)}`
+    );
+
+    // Password reset behavior: unknown accounts stay generic and requests are throttled.
+    const requestReset = () =>
+      fetch(`${BASE_URL}/api/auth/request-reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: `missing_${Date.now()}@invalid.example` }),
+      });
+    const resetRes = await requestReset();
+    const resetJson = await resetRes.json() as { ok?: boolean; message?: string; demoVerificationCode?: string };
+    record(
+      'Password Reset Does Not Reveal Account or Code',
+      resetRes.status === 200 &&
+        resetJson.ok === true &&
+        resetJson.message === 'If the account exists, a reset code has been sent.' &&
+        !('demoVerificationCode' in resetJson),
+      'Unknown addresses receive the generic response with no verification code'
+    );
+
+    const resetStaff = (await db.prepare(
+      `SELECT u.id, u.email
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       WHERE u.status = 'active' AND r.slug <> 'customer'
+       LIMIT 1`
+    ).get()) as { id: string; email: string } | undefined;
+    if (resetStaff) {
+      const deliveryFailureRes = await fetch(`${BASE_URL}/api/auth/request-reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: resetStaff.email }),
+      });
+      const deliveryFailureJson = await deliveryFailureRes.json() as { error?: string; demoVerificationCode?: string };
+      const storedReset = (await db.prepare(
+        'SELECT code, used FROM password_resets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1'
+      ).get(resetStaff.id)) as { code: string; used: number } | undefined;
+      record(
+        'Password Reset Delivery Failure Is Safe',
+        deliveryFailureRes.status === 502 &&
+          !('demoVerificationCode' in deliveryFailureJson) &&
+          storedReset?.code.length === 64 &&
+          Number(storedReset.used) === 1,
+        'SMTP failure returns an error, stores only a hash, and invalidates the code'
+      );
+    } else {
+      record('Password Reset Delivery Failure Is Safe', false, undefined, 'No active staff account in the isolated E2E database');
+    }
+
+    let rateLimitRes: Response | undefined;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      rateLimitRes = await requestReset();
+    }
+    record(
+      'Password Reset Requests Are Rate Limited',
+      rateLimitRes?.status === 429 && Number(rateLimitRes.headers.get('retry-after')) > 0,
+      `Final response status: ${rateLimitRes?.status}`
+    );
 
     // 3. Catalog & Products
     console.log('\n--- 3. PRODUCT CATALOG & SEARCH ---');
@@ -96,8 +181,8 @@ async function runE2ETestSuite() {
     const singleJson = await singleRes.json() as { product: { id: string; name: string } };
     record('Product Lookup by Slug', singleRes.status === 200 && singleJson.product.id === 'prod_ps5_pro', singleJson.product.name);
 
-    // 4. Product Reviews (Persistent SQLite)
-    console.log('\n--- 4. CUSTOMER REVIEWS (SQLITE PERSISTENT) ---');
+    // 4. Product Reviews (Persistent MySQL)
+    console.log('\n--- 4. CUSTOMER REVIEWS (MYSQL PERSISTENT) ---');
     const revsRes = await fetch(`${BASE_URL}/api/products/prod_ps5_pro/reviews`);
     const revsJson = await revsRes.json() as { reviews: Array<{ id: string; helpfulCount: number }>; summary: { averageRating: number } };
     record('Product Reviews Query', revsRes.status === 200 && revsJson.reviews.length >= 2, `Avg Rating: ${revsJson.summary.averageRating}, Count: ${revsJson.reviews.length}`);
@@ -124,7 +209,7 @@ async function runE2ETestSuite() {
     const helpfulJson = await helpfulRes.json() as { ok: boolean; helpfulCount: number };
     record('Mark Review Helpful', helpfulRes.status === 200 && helpfulJson.helpfulCount === 1, `Helpful count: ${helpfulJson.helpfulCount}`);
 
-    // 5. Stock Waitlist (Persistent SQLite)
+    // 5. Stock Waitlist (Persistent MySQL)
     console.log('\n--- 5. RESTOCK NOTIFICATION SUBSCRIBER ---');
     const testEmail = `shopper_${Date.now()}@example.com`;
     const notifyRes = await fetch(`${BASE_URL}/api/products/prod_ps5_pro/notify`, {
@@ -163,7 +248,7 @@ async function runE2ETestSuite() {
       shippingAddress: 'Hamra Main Street, Bldg 42, 3rd Floor',
       city: 'Beirut',
       postalCode: '1103',
-      paymentMethod: 'whatsapp_cod',
+      paymentMethod: 'cod',
       items: [
         {
           productId: 'prod_ps5_pro',
@@ -172,6 +257,17 @@ async function runE2ETestSuite() {
         },
       ],
     };
+    const unsupportedPaymentRes = await fetch(`${BASE_URL}/api/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...newOrderPayload, paymentMethod: 'card' }),
+    });
+    record(
+      'Unsupported Card Payment Rejected',
+      unsupportedPaymentRes.status === 400,
+      'Checkout does not claim card payment without a configured processor'
+    );
+
     const orderPostRes = await fetch(`${BASE_URL}/api/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -206,7 +302,7 @@ async function runE2ETestSuite() {
     record('Session Token Authorization (/api/auth/me)', meRes.status === 200 && meJson.user?.roleSlug === 'owner', `Authenticated as: ${meJson.user?.name}`);
 
     // Admin Protected Endpoint (Analytics)
-    const analyticsRes = await fetch(`${BASE_URL}/api/admin/analytics/overview`, {
+    const analyticsRes = await fetch(`${BASE_URL}/api/admin/analytics`, {
       headers: { cookie: adminCookie },
     });
     record('Admin Analytics Access', analyticsRes.status === 200, 'Owner granted full analytics access');
@@ -283,7 +379,12 @@ async function runE2ETestSuite() {
     console.error('Fatal test error:', err);
   } finally {
     if (serverProcess) {
+      const exited = new Promise<void>((resolve) => serverProcess?.once('exit', () => resolve()));
       serverProcess.kill('SIGTERM');
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+      ]);
       console.log('\nServer process shut down cleanly.');
     }
   }
@@ -298,8 +399,11 @@ async function runE2ETestSuite() {
   console.log(`Total Checks: ${total}`);
   console.log(`Passed:       ${passedCount}`);
   console.log(`Failed:       ${failedCount}`);
-  console.log(`Status:       ${failedCount === 0 ? '🟢 100% PRODUCTION READY - ZERO DEFECTS' : '🔴 ACTION REQUIRED'}`);
+  console.log(`Status:       ${failedCount === 0 ? 'PASSED' : 'FAILED — ACTION REQUIRED'}`);
   console.log('====================================================\n');
 }
 
-runE2ETestSuite();
+runE2ETestSuite().catch((error) => {
+  console.error('E2E test suite could not run safely:', error);
+  process.exitCode = 1;
+});

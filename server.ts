@@ -1,8 +1,10 @@
 import 'dotenv/config';
+import 'express-async-errors';
 import express from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import nodemailer, { type Transporter } from 'nodemailer';
 import {
   db,
   getStoreSettings,
@@ -37,8 +39,6 @@ import type {
   RestockNotification,
 } from './src/types.ts';
 
-initDatabase();
-
 function mapReviewRow(row: Record<string, unknown>): ProductReview {
   return {
     id: String(row.id),
@@ -66,9 +66,11 @@ function mapWaitlistRow(row: Record<string, unknown>): RestockNotification {
   };
 }
 
-function computeRatingSummary(productId: string): ProductRatingSummary {
+async function computeRatingSummary(productId: string): Promise<ProductRatingSummary> {
   const distribution: Record<1 | 2 | 3 | 4 | 5, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-  const rows = db.prepare('SELECT rating FROM product_reviews WHERE product_id = ?').all(productId) as Array<{ rating: number }>;
+  const rows = (await db
+    .prepare('SELECT rating FROM product_reviews WHERE product_id = ?')
+    .all(productId)) as Array<{ rating: number }>;
   if (rows.length === 0) {
     return { averageRating: 0, reviewCount: 0, distribution };
   }
@@ -85,10 +87,10 @@ function computeRatingSummary(productId: string): ProductRatingSummary {
   };
 }
 
-function getActiveFlashSales(nowMs = Date.now()): FlashSale[] {
-  const rows = db
+async function getActiveFlashSales(nowMs = Date.now()): Promise<FlashSale[]> {
+  const rows = (await db
     .prepare('SELECT * FROM flash_sales WHERE active = 1 ORDER BY discount_pct DESC, expires_at ASC')
-    .all() as Record<string, unknown>[];
+    .all()) as Record<string, unknown>[];
   return rows
     .map(mapFlashSaleRow)
     .filter((sale) => {
@@ -179,35 +181,88 @@ function authRateLimiter(req: express.Request, res: express.Response, next: expr
   next();
 }
 
+const passwordResetRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+function passwordResetRateLimiter(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const maxAttempts = 5;
+
+  for (const [key, entry] of passwordResetRateLimitMap) {
+    if (now >= entry.resetAt) passwordResetRateLimitMap.delete(key);
+  }
+
+  const current = passwordResetRateLimitMap.get(ip);
+  if (!current || now >= current.resetAt) {
+    passwordResetRateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
+    return next();
+  }
+
+  if (current.count >= maxAttempts) {
+    const retryAfterSec = Math.ceil((current.resetAt - now) / 1000);
+    res.setHeader('Retry-After', retryAfterSec);
+    res.status(429).json({ error: 'Too many password reset requests. Please try again later.' });
+    return;
+  }
+
+  current.count += 1;
+  next();
+}
+
+function hashPasswordResetCode(code: string): string {
+  const secret = process.env.SESSION_SECRET;
+  if (!secret) throw new Error('SESSION_SECRET is required to issue password reset codes.');
+  return crypto.createHmac('sha256', secret).update(code).digest('hex');
+}
+
+function createPasswordResetMailer(): { transporter: Transporter; from: string } {
+  const host = process.env.SMTP_HOST?.trim();
+  const user = process.env.SMTP_USER?.trim();
+  const password = process.env.SMTP_PASS;
+  const from = process.env.MAIL_FROM?.trim() || process.env.SMTP_FROM?.trim() || user;
+  const port = Number(process.env.SMTP_PORT || '465');
+  const secureSetting = process.env.SMTP_SECURE?.trim().toLowerCase();
+
+  if (!host || !user || !password || !from) {
+    throw new Error('SMTP_HOST, SMTP_USER, SMTP_PASS, and MAIL_FROM must be configured.');
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('SMTP_PORT must be an integer between 1 and 65535.');
+  }
+  if (secureSetting !== 'true' && secureSetting !== 'false') {
+    throw new Error('SMTP_SECURE must be set to true or false.');
+  }
+
+  return {
+    transporter: nodemailer.createTransport({
+      host,
+      port,
+      secure: secureSetting === 'true',
+      auth: { user, pass: password },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000,
+    }),
+    from,
+  };
+}
+
 app.use(express.json({ limit: '6mb' }));
 app.use('/uploads', express.static(uploadsDir, { maxAge: '7d' }));
 app.use(attachOptionalUser);
 
-function isValidLuhn(cardNumber: string): boolean {
-  const digits = cardNumber.replace(/\D/g, '');
-  if (digits.length < 13 || digits.length > 19) return false;
-  let sum = 0;
-  let shouldDouble = false;
-  for (let i = digits.length - 1; i >= 0; i--) {
-    let d = Number(digits[i]);
-    if (shouldDouble) {
-      d *= 2;
-      if (d > 9) d -= 9;
-    }
-    sum += d;
-    shouldDouble = !shouldDouble;
-  }
-  return sum % 10 === 0;
-}
-
-function getOrderWithItems(orderId: string): Order | null {
-  const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId) as
+async function getOrderWithItems(orderId: string): Promise<Order | null> {
+  const row = (await db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId)) as
     | Record<string, unknown>
     | undefined;
   if (!row) return null;
-  const itemRows = db
+  const itemRows = (await db
     .prepare('SELECT * FROM order_items WHERE order_id = ?')
-    .all(orderId) as Record<string, unknown>[];
+    .all(orderId)) as Record<string, unknown>[];
   return mapOrderRow(row, itemRows.map(mapOrderItemRow));
 }
 
@@ -222,26 +277,26 @@ function setSessionCookie(res: express.Response, token: string): void {
 }
 
 // Health check & public store settings
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', async (_req, res) => {
   res.json({ ok: true, store: 'Sam Brand Store', timestamp: new Date().toISOString() });
 });
 
-app.get('/api/settings/public', (_req, res) => {
-  res.json(getStoreSettings());
+app.get('/api/settings/public', async (_req, res) => {
+  res.json(await getStoreSettings());
 });
 
 // ==================== AUTH ====================
 
-app.post('/api/auth/login', authRateLimiter, (req, res) => {
+app.post('/api/auth/login', authRateLimiter, async (req, res) => {
   const { email, password } = req.body as { email?: string; password?: string };
   if (!email || !password) {
     res.status(400).json({ error: 'Email and password are required.' });
     return;
   }
 
-  const row = db
+  const row = (await db
     .prepare('SELECT id, password_hash, status FROM users WHERE LOWER(email) = LOWER(?)')
-    .get(email.trim()) as { id: string; password_hash: string; status: string } | undefined;
+    .get(email.trim())) as { id: string; password_hash: string; status: string } | undefined;
 
   if (!row || !verifyPassword(password, row.password_hash)) {
     res.status(401).json({ error: 'Invalid email or password.' });
@@ -254,9 +309,9 @@ app.post('/api/auth/login', authRateLimiter, (req, res) => {
   }
 
   const now = new Date().toISOString();
-  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, row.id);
+  await db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, row.id);
 
-  const user = loadUserById(row.id);
+  const user = await loadUserById(row.id);
   if (!user) {
     res.status(500).json({ error: 'Failed to load user profile.' });
     return;
@@ -273,84 +328,121 @@ app.post('/api/auth/login', authRateLimiter, (req, res) => {
   const token = signSessionToken(user.id);
   setSessionCookie(res, token);
 
-  logAudit(user.id, user.name, user.roleName, 'STAFF_LOGIN', 'user', user.id, 'Authenticated into workspace.');
+  await logAudit(user.id, user.name, user.roleName, 'STAFF_LOGIN', 'user', user.id, 'Authenticated into workspace.');
 
   res.json({ token, user });
 });
 
-app.post('/api/auth/register', (_req, res) => {
+app.post('/api/auth/register', async (_req, res) => {
   res.status(403).json({
     error: 'Public registration is disabled. Store Admin provisions all Employee accounts.',
   });
 });
 
-app.post('/api/auth/logout', (_req, res) => {
+app.post('/api/auth/logout', async (_req, res) => {
   res.clearCookie('sbs_session', { path: '/' });
   res.json({ ok: true });
 });
 
-app.get('/api/auth/me', (req: AuthenticatedRequest, res) => {
+app.get('/api/auth/me', async (req: AuthenticatedRequest, res) => {
   res.json({ user: req.authUser || null });
 });
 
-app.post('/api/auth/request-reset', authRateLimiter, (req, res) => {
+app.post('/api/auth/request-reset', authRateLimiter, passwordResetRateLimiter, async (req, res) => {
   const { email } = req.body as { email?: string };
   if (!email?.trim()) {
-    res.status(400).json({ error: 'Employee email is required.' });
+    res.status(400).json({ error: 'Email address is required.' });
     return;
   }
 
-  const row = db
+  let mailer: { transporter: Transporter; from: string };
+  try {
+    mailer = createPasswordResetMailer();
+    if (!process.env.SESSION_SECRET) {
+      throw new Error('SESSION_SECRET is required to issue password reset codes.');
+    }
+  } catch (error) {
+    console.error('Password reset email configuration is invalid.', {
+      reason: error instanceof Error ? error.message : 'Unknown configuration error',
+    });
+    res.status(503).json({
+      error: 'Password reset email is temporarily unavailable. Please contact support.',
+    });
+    return;
+  }
+
+  const row = (await db
     .prepare(
       `
-      SELECT u.id, u.name, u.status, r.slug as role_slug, r.name as role_name
+      SELECT u.id, u.name, u.email, u.status, r.slug as role_slug, r.name as role_name
       FROM users u
       JOIN roles r ON u.role_id = r.id
       WHERE LOWER(u.email) = LOWER(?)
     `
     )
-    .get(email.trim()) as
-    | { id: string; name: string; status: string; role_slug: string; role_name: string }
+    .get(email.trim())) as
+    | { id: string; name: string; email: string; status: string; role_slug: string; role_name: string }
     | undefined;
 
-  if (!row || row.role_slug === 'customer' || row.status !== 'active') {
-    res.status(404).json({ error: 'No active staff or admin account matched that email.' });
+  if (!row || row.status !== 'active') {
+    res.json({
+      ok: true,
+      message: 'If the account exists, a reset code has been sent.',
+    });
     return;
   }
 
-  const code = String(crypto.randomInt(100000, 999999));
+  const code = String(crypto.randomInt(100000, 1_000_000));
+  const codeHash = hashPasswordResetCode(code);
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 15 * 60_000).toISOString();
+  const resetId = `rst_${crypto.randomUUID().slice(0, 10)}`;
 
-  db.prepare('UPDATE password_resets SET used = 1 WHERE user_id = ?').run(row.id);
-  db.prepare(
+  await db.prepare('UPDATE password_resets SET used = 1 WHERE user_id = ?').run(row.id);
+  await db.prepare(
     `
     INSERT INTO password_resets (id, user_id, code, expires_at, used, created_at)
     VALUES (?, ?, ?, ?, 0, ?)
   `
-  ).run(`rst_${crypto.randomUUID().slice(0, 10)}`, row.id, code, expiresAt, now.toISOString());
+  ).run(resetId, row.id, codeHash, expiresAt, now.toISOString());
 
-  logAudit(
+  try {
+    await mailer.transporter.sendMail({
+      from: mailer.from,
+      to: row.email,
+      subject: 'Your Sam Brand Store password reset code',
+      text: `Hello ${row.name},\n\nYour password reset code is ${code}. It expires in 15 minutes. If you did not request this, you can ignore this email.\n`,
+    });
+  } catch (error) {
+    await db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(resetId);
+    const errorCode =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? String(error.code)
+        : 'UNKNOWN';
+    console.error('Password reset email delivery failed.', { code: errorCode });
+    res.status(502).json({
+      error: 'Unable to send a password reset email right now. Please try again later.',
+    });
+    return;
+  }
+
+  await logAudit(
     row.id,
     row.name,
     row.role_name,
     'PASSWORD_RESET_REQUESTED',
     'user',
     row.id,
-    `Generated 15-minute verification reset code for ${email.trim()}`
+    'Sent a 15-minute password reset email.'
   );
-
-  // Also log to server console for Hostinger deployment admins without SMTP configured
-  console.log(`[SBS Password Reset] ${email.trim()} -> Code: ${code} (expires ${expiresAt})`);
 
   res.json({
     ok: true,
-    message: 'A 6-digit verification code has been generated for your account.',
-    demoVerificationCode: process.env.NODE_ENV === 'production' ? undefined : code,
+    message: 'If the account exists, a reset code has been sent.',
   });
 });
 
-app.post('/api/auth/reset-password', authRateLimiter, (req: AuthenticatedRequest, res) => {
+app.post('/api/auth/reset-password', authRateLimiter, async (req: AuthenticatedRequest, res) => {
   const { email, currentPassword, resetCode, newPassword } = req.body as {
     email?: string;
     currentPassword?: string;
@@ -369,7 +461,7 @@ app.post('/api/auth/reset-password', authRateLimiter, (req: AuthenticatedRequest
     return;
   }
 
-  const row = db
+  const row = (await db
     .prepare(
       `
       SELECT u.id, u.name, u.password_hash, u.status, r.slug as role_slug, r.name as role_name
@@ -378,7 +470,7 @@ app.post('/api/auth/reset-password', authRateLimiter, (req: AuthenticatedRequest
       WHERE LOWER(u.email) = LOWER(?)
     `
     )
-    .get(targetEmail) as
+    .get(targetEmail)) as
     | {
         id: string;
         name: string;
@@ -403,21 +495,23 @@ app.post('/api/auth/reset-password', authRateLimiter, (req: AuthenticatedRequest
     }
     authorized = true;
   } else if (resetCode) {
-    const tokenRow = db
+    const tokenRow = (await db
       .prepare(
         `
         SELECT id, expires_at FROM password_resets
-        WHERE user_id = ? AND code = ? AND used = 0
+          WHERE user_id = ? AND code = ? AND used = 0
         ORDER BY created_at DESC LIMIT 1
       `
       )
-      .get(row.id, resetCode.trim()) as { id: string; expires_at: string } | undefined;
+        .get(row.id, hashPasswordResetCode(resetCode.trim()))) as
+        | { id: string; expires_at: string }
+        | undefined;
 
     if (!tokenRow || new Date(tokenRow.expires_at).getTime() < Date.now()) {
       res.status(400).json({ error: 'Invalid or expired 6-digit verification code.' });
       return;
     }
-    db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(tokenRow.id);
+    await db.prepare('UPDATE password_resets SET used = 1 WHERE id = ?').run(tokenRow.id);
     authorized = true;
   }
 
@@ -428,12 +522,12 @@ app.post('/api/auth/reset-password', authRateLimiter, (req: AuthenticatedRequest
     return;
   }
 
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
+  await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
     hashPassword(newPassword.trim()),
     row.id
   );
 
-  logAudit(
+  await logAudit(
     row.id,
     row.name,
     row.role_name,
@@ -448,16 +542,150 @@ app.post('/api/auth/reset-password', authRateLimiter, (req: AuthenticatedRequest
 
 // ==================== PUBLIC CATALOG & CAMPAIGNS ====================
 
-app.get('/api/products', (req, res) => {
+function mapCategoryRow(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    slug: String(row.slug),
+    subtitle: String(row.subtitle || ''),
+    imageUrl: row.image_url ? String(row.image_url) : null,
+    sortOrder: Number(row.sort_order),
+    active: Boolean(row.active),
+    showInMenu: row.show_in_menu === undefined ? true : Boolean(row.show_in_menu),
+    menuLabel: String(row.menu_label || row.name || ''),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+app.get('/api/categories', async (_req, res) => {
+  const rows = (await db
+    .prepare('SELECT * FROM store_categories WHERE active = 1 ORDER BY sort_order ASC, name ASC')
+    .all()) as Record<string, unknown>[];
+  res.json({ categories: rows.map(mapCategoryRow) });
+});
+
+app.get('/api/admin/categories', requirePermission('products:read'), async (_req, res) => {
+  const rows = (await db
+    .prepare('SELECT * FROM store_categories ORDER BY sort_order ASC, name ASC')
+    .all()) as Record<string, unknown>[];
+  res.json({ categories: rows.map(mapCategoryRow) });
+});
+
+app.post('/api/admin/categories', requirePermission('products:write'), async (req: AuthenticatedRequest, res) => {
+  const b = req.body as { name?: string; subtitle?: string; imageUrl?: string | null; sortOrder?: number; active?: boolean; showInMenu?: boolean; menuLabel?: string };
+  const name = b.name?.trim() || '';
+  if (name.length < 2 || name.length > 100) {
+    res.status(400).json({ error: 'Category name must be between 2 and 100 characters.' });
+    return;
+  }
+  const existing = await db.prepare('SELECT id FROM store_categories WHERE LOWER(name) = LOWER(?)').get(name);
+  if (existing) {
+    res.status(409).json({ error: 'A category with this name already exists.' });
+    return;
+  }
+  const slug = name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `category-${Date.now()}`;
+  const slugTaken = await db.prepare('SELECT id FROM store_categories WHERE slug = ?').get(slug);
+  if (slugTaken) {
+    res.status(409).json({ error: 'A category with this URL name already exists.' });
+    return;
+  }
+  const now = new Date().toISOString();
+  const id = `cat_${crypto.randomUUID().slice(0, 12)}`;
+  await db.prepare(
+    'INSERT INTO store_categories (id, name, slug, subtitle, image_url, sort_order, active, show_in_menu, menu_label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, name, slug, b.subtitle?.trim() || '', b.imageUrl?.trim() || null, Number.isFinite(Number(b.sortOrder)) ? Number(b.sortOrder) : 0, b.active === false ? 0 : 1, b.showInMenu === false ? 0 : 1, b.menuLabel?.trim() || name, now, now);
+  const row = await db.prepare('SELECT * FROM store_categories WHERE id = ?').get(id) as Record<string, unknown>;
+  await logAudit(req.authUser!.id, req.authUser!.name, req.authUser!.roleName, 'CATEGORY_CREATED', 'category', id, `Created category "${name}".`);
+  res.status(201).json({ category: mapCategoryRow(row) });
+});
+
+app.patch('/api/admin/categories/:id', requirePermission('products:write'), async (req: AuthenticatedRequest, res) => {
+  const existing = await db.prepare('SELECT * FROM store_categories WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Category not found.' });
+    return;
+  }
+  const b = req.body as { name?: string; subtitle?: string; imageUrl?: string | null; sortOrder?: number; active?: boolean; showInMenu?: boolean; menuLabel?: string };
+  const name = b.name !== undefined ? b.name.trim() : String(existing.name);
+  if (name.length < 2 || name.length > 100) {
+    res.status(400).json({ error: 'Category name must be between 2 and 100 characters.' });
+    return;
+  }
+  const duplicate = await db.prepare('SELECT id FROM store_categories WHERE LOWER(name) = LOWER(?) AND id <> ?').get(name, String(existing.id));
+  if (duplicate) {
+    res.status(409).json({ error: 'A category with this name already exists.' });
+    return;
+  }
+  const slug = b.name !== undefined
+    ? name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || String(existing.slug)
+    : String(existing.slug);
+  const duplicateSlug = await db.prepare('SELECT id FROM store_categories WHERE slug = ? AND id <> ?').get(slug, String(existing.id));
+  if (duplicateSlug) {
+    res.status(409).json({ error: 'A category with this URL name already exists.' });
+    return;
+  }
+  const now = new Date().toISOString();
+  await db.prepare(
+    'UPDATE store_categories SET name = ?, slug = ?, subtitle = ?, image_url = ?, sort_order = ?, active = ?, show_in_menu = ?, menu_label = ?, updated_at = ? WHERE id = ?'
+  ).run(
+    name,
+    slug,
+    b.subtitle !== undefined ? b.subtitle.trim() : String(existing.subtitle || ''),
+    b.imageUrl !== undefined ? (b.imageUrl?.trim() || null) : (existing.image_url ? String(existing.image_url) : null),
+    b.sortOrder !== undefined && Number.isFinite(Number(b.sortOrder)) ? Number(b.sortOrder) : Number(existing.sort_order),
+    b.active !== undefined ? (b.active ? 1 : 0) : Number(existing.active),
+    b.showInMenu !== undefined ? (b.showInMenu ? 1 : 0) : Number(existing.show_in_menu ?? 1),
+    b.menuLabel !== undefined ? b.menuLabel.trim() : String(existing.menu_label || name),
+    now,
+    String(existing.id)
+  );
+  if (name !== String(existing.name)) {
+    await db.prepare('UPDATE products SET category = ?, updated_at = ? WHERE category = ?').run(name, now, String(existing.name));
+  }
+  const row = await db.prepare('SELECT * FROM store_categories WHERE id = ?').get(req.params.id) as Record<string, unknown>;
+  await logAudit(req.authUser!.id, req.authUser!.name, req.authUser!.roleName, 'CATEGORY_UPDATED', 'category', req.params.id, `Updated category "${name}".`);
+  res.json({ category: mapCategoryRow(row) });
+});
+
+app.delete('/api/admin/categories/:id', requirePermission('products:write'), async (req: AuthenticatedRequest, res) => {
+  const existing = await db.prepare('SELECT id, name FROM store_categories WHERE id = ?').get(req.params.id) as { id: string; name: string } | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Category not found.' });
+    return;
+  }
+  const used = await db.prepare('SELECT id FROM products WHERE category = ? LIMIT 1').get(existing.name);
+  if (used) {
+    res.status(409).json({ error: 'This category is in use by products. Reassign or remove those products before deleting it.' });
+    return;
+  }
+  await db.prepare('DELETE FROM store_categories WHERE id = ?').run(existing.id);
+  await logAudit(req.authUser!.id, req.authUser!.name, req.authUser!.roleName, 'CATEGORY_DELETED', 'category', existing.id, `Deleted category "${existing.name}".`);
+  res.json({ ok: true });
+});
+
+app.get('/api/products', async (req, res) => {
   const category = typeof req.query.category === 'string' ? req.query.category : '';
   const search = typeof req.query.search === 'string' ? req.query.search.trim().toLowerCase() : '';
 
-  let rows = db
+  let rows = (await db
     .prepare('SELECT * FROM products WHERE active = 1 ORDER BY featured DESC, created_at ASC')
-    .all() as Record<string, unknown>[];
+    .all()) as Record<string, unknown>[];
 
-  if (category && category !== 'All') {
-    rows = rows.filter((r) => String(r.category).toLowerCase() === category.toLowerCase());
+  const allCategory = category && ['all', 'all-gear', 'all gear'].includes(category.trim().toLowerCase());
+  if (category && category !== 'All' && !allCategory) {
+    const categoryRow = await db
+      .prepare('SELECT name FROM store_categories WHERE slug = ? OR LOWER(name) = LOWER(?)')
+      .get(category, category) as { name: string } | undefined;
+    const resolvedCategory = categoryRow?.name || category;
+    const specialSlug = category.trim().toLowerCase();
+    if (specialSlug === 'featured-picks' || specialSlug === 'flagship-picks') {
+      rows = rows.filter((r) => Boolean(r.featured));
+    } else if (specialSlug === 'special-offers' || specialSlug === 'deals') {
+      rows = rows.filter((r) => Boolean(r.compare_at_price) && Number(r.compare_at_price) > Number(r.price));
+    } else {
+      rows = rows.filter((r) => String(r.category).toLowerCase() === resolvedCategory.toLowerCase());
+    }
   }
   if (search) {
     rows = rows.filter(
@@ -469,34 +697,35 @@ app.get('/api/products', (req, res) => {
     );
   }
 
-  const activeSales = getActiveFlashSales();
+  const activeSales = await getActiveFlashSales();
 
-  res.json({
-    products: rows.map((row) => {
+  const products = await Promise.all(
+    rows.map(async (row) => {
       const mapped = applyFlashSaleToProduct(mapProductRow(row), activeSales);
-      const summary = computeRatingSummary(mapped.id);
+      const summary = await computeRatingSummary(mapped.id);
       return {
         ...mapped,
         averageRating: summary.averageRating,
         reviewCount: summary.reviewCount,
       };
-    }),
-  });
+    })
+  );
+  res.json({ products });
 });
 
-app.get('/api/products/:slugOrId', (req, res) => {
-  const row = db
+app.get('/api/products/:slugOrId', async (req, res) => {
+  const row = (await db
     .prepare('SELECT * FROM products WHERE (id = ? OR slug = ?) AND active = 1')
-    .get(req.params.slugOrId, req.params.slugOrId) as Record<string, unknown> | undefined;
+    .get(req.params.slugOrId, req.params.slugOrId)) as Record<string, unknown> | undefined;
 
   if (!row) {
     res.status(404).json({ error: 'Product not found.' });
     return;
   }
 
-  const activeSales = getActiveFlashSales();
+  const activeSales = await getActiveFlashSales();
   const mapped = applyFlashSaleToProduct(mapProductRow(row), activeSales);
-  const summary = computeRatingSummary(mapped.id);
+  const summary = await computeRatingSummary(mapped.id);
 
   res.json({
     product: {
@@ -507,10 +736,10 @@ app.get('/api/products/:slugOrId', (req, res) => {
   });
 });
 
-app.get('/api/products/:id/reviews', (req, res) => {
-  const productRow = db
+app.get('/api/products/:id/reviews', async (req, res) => {
+  const productRow = (await db
     .prepare('SELECT id, name FROM products WHERE id = ? AND active = 1')
-    .get(req.params.id) as { id: string; name: string } | undefined;
+    .get(req.params.id)) as { id: string; name: string } | undefined;
 
   if (!productRow) {
     res.status(404).json({ error: 'Product not found.' });
@@ -523,21 +752,21 @@ app.get('/api/products/:id/reviews', (req, res) => {
   if (sort === 'highest') orderBy = 'rating DESC, created_at DESC';
   if (sort === 'lowest') orderBy = 'rating ASC, created_at DESC';
 
-  const rows = db
+  const rows = (await db
     .prepare(`SELECT * FROM product_reviews WHERE product_id = ? ORDER BY ${orderBy}`)
-    .all(productRow.id) as Record<string, unknown>[];
+    .all(productRow.id)) as Record<string, unknown>[];
   const reviews = rows.map(mapReviewRow);
 
   res.json({
-    summary: computeRatingSummary(productRow.id),
+    summary: await computeRatingSummary(productRow.id),
     reviews,
   });
 });
 
-app.post('/api/products/:id/reviews', (req: AuthenticatedRequest, res) => {
-  const productRow = db
+app.post('/api/products/:id/reviews', async (req: AuthenticatedRequest, res) => {
+  const productRow = (await db
     .prepare('SELECT id, name, sku FROM products WHERE id = ? AND active = 1')
-    .get(req.params.id) as { id: string; name: string; sku: string } | undefined;
+    .get(req.params.id)) as { id: string; name: string; sku: string } | undefined;
 
   if (!productRow) {
     res.status(404).json({ error: 'Product not found.' });
@@ -573,7 +802,7 @@ app.post('/api/products/:id/reviews', (req: AuthenticatedRequest, res) => {
 
   let verifiedPurchase = false;
   if (authorEmail) {
-    const orderMatch = db
+    const orderMatch = (await db
       .prepare(
         `
         SELECT o.id FROM orders o
@@ -582,7 +811,7 @@ app.post('/api/products/:id/reviews', (req: AuthenticatedRequest, res) => {
         LIMIT 1
       `
       )
-      .get(authorEmail, productRow.id) as { id: string } | undefined;
+      .get(authorEmail, productRow.id)) as { id: string } | undefined;
     verifiedPurchase = Boolean(orderMatch);
   }
 
@@ -599,13 +828,13 @@ app.post('/api/products/:id/reviews', (req: AuthenticatedRequest, res) => {
     createdAt: new Date().toISOString(),
   };
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO product_reviews (id, product_id, product_name, author_name, author_email, rating, title, comment, verified_purchase, helpful_count, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
   `).run(
     review.id,
     review.productId,
-    review.productName,
+    productRow.name,
     review.authorName,
     authorEmail || null,
     review.rating,
@@ -615,7 +844,7 @@ app.post('/api/products/:id/reviews', (req: AuthenticatedRequest, res) => {
     review.createdAt
   );
 
-  logAudit(
+  await logAudit(
     req.authUser?.id || 'guest_shopper',
     authorName,
     req.authUser?.roleName || 'Customer',
@@ -625,45 +854,45 @@ app.post('/api/products/:id/reviews', (req: AuthenticatedRequest, res) => {
     `${rating}/5 star review posted on ${productRow.name} (${productRow.sku}) by ${authorName}`
   );
 
-  const updatedRows = db
+  const updatedRows = (await db
     .prepare('SELECT * FROM product_reviews WHERE product_id = ? ORDER BY created_at DESC')
-    .all(productRow.id) as Record<string, unknown>[];
+    .all(productRow.id)) as Record<string, unknown>[];
 
   res.status(201).json({
     review,
-    summary: computeRatingSummary(productRow.id),
+    summary: await computeRatingSummary(productRow.id),
     reviews: updatedRows.map(mapReviewRow),
   });
 });
 
-app.post('/api/products/:id/reviews/:reviewId/helpful', (req, res) => {
-  const row = db
+app.post('/api/products/:id/reviews/:reviewId/helpful', async (req, res) => {
+  const row = (await db
     .prepare('SELECT helpful_count FROM product_reviews WHERE id = ? AND product_id = ?')
-    .get(req.params.reviewId, req.params.id) as { helpful_count: number } | undefined;
+    .get(req.params.reviewId, req.params.id)) as { helpful_count: number } | undefined;
   if (!row) {
     res.status(404).json({ error: 'Review not found.' });
     return;
   }
   const nextCount = row.helpful_count + 1;
-  db.prepare('UPDATE product_reviews SET helpful_count = ? WHERE id = ?').run(nextCount, req.params.reviewId);
+  await db.prepare('UPDATE product_reviews SET helpful_count = ? WHERE id = ?').run(nextCount, req.params.reviewId);
   res.json({ ok: true, helpfulCount: nextCount });
 });
 
-app.get('/api/campaigns', (_req, res) => {
-  const rows = db
+app.get('/api/campaigns', async (_req, res) => {
+  const rows = (await db
     .prepare('SELECT * FROM campaigns WHERE active = 1 ORDER BY sort_order ASC, created_at DESC')
-    .all() as Record<string, unknown>[];
+    .all()) as Record<string, unknown>[];
   res.json({ campaigns: rows.map(mapCampaignRow) });
 });
 
-app.get('/api/flash-sales', (_req, res) => {
+app.get('/api/flash-sales', async (_req, res) => {
   res.json({
-    flashSales: getActiveFlashSales(),
+    flashSales: await getActiveFlashSales(),
     serverTime: new Date().toISOString(),
   });
 });
 
-app.post('/api/products/:id/notify', (req, res) => {
+app.post('/api/products/:id/notify', async (req, res) => {
   const { email, variant } = req.body as { email?: string; variant?: string };
   const cleanEmail = (email || '').trim().toLowerCase();
   if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
@@ -671,9 +900,9 @@ app.post('/api/products/:id/notify', (req, res) => {
     return;
   }
 
-  const row = db
+  const row = (await db
     .prepare('SELECT id, name, sku, stock FROM products WHERE id = ? AND active = 1')
-    .get(req.params.id) as { id: string; name: string; sku: string; stock: number } | undefined;
+    .get(req.params.id)) as { id: string; name: string; sku: string; stock: number } | undefined;
 
   if (!row) {
     res.status(404).json({ error: 'Product not found.' });
@@ -681,15 +910,14 @@ app.post('/api/products/:id/notify', (req, res) => {
   }
 
   const chosenVariant = (variant || 'Standard').trim();
-  const existing = db
+  const existing = (await db
     .prepare('SELECT * FROM stock_waitlist WHERE product_id = ? AND LOWER(email) = LOWER(?)')
-    .get(row.id, cleanEmail) as Record<string, unknown> | undefined;
+    .get(row.id, cleanEmail)) as Record<string, unknown> | undefined;
 
-  const totalSubs = (
-    db.prepare('SELECT count(*) as c FROM stock_waitlist WHERE product_id = ?').get(row.id) as {
-      c: number;
-    }
-  ).c;
+  const totalSubsRow = await db
+    .prepare('SELECT count(*) as c FROM stock_waitlist WHERE product_id = ?')
+    .get(row.id);
+  const totalSubs = Number((totalSubsRow as { c: number } | undefined)?.c ?? 0);
 
   if (existing) {
     res.json({
@@ -712,12 +940,12 @@ app.post('/api/products/:id/notify', (req, res) => {
     createdAt: new Date().toISOString(),
   };
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO stock_waitlist (id, product_id, product_name, sku, variant, email, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(entry.id, entry.productId, entry.productName, entry.sku, entry.variant, entry.email, entry.createdAt);
 
-  logAudit(
+  await logAudit(
     'guest_shopper',
     cleanEmail,
     'Customer',
@@ -773,7 +1001,9 @@ function evaluatePromo(codeRaw: string | null | undefined, subtotal: number): {
   return { valid: false, code: null, discountAmount: 0, freeShipping: false, label: 'Invalid promo code' };
 }
 
-app.post('/api/promo/validate', (req, res) => {
+class CheckoutError extends Error {}
+
+app.post('/api/promo/validate', async (req, res) => {
   const { code, subtotal } = req.body as { code?: string; subtotal?: number };
   const result = evaluatePromo(code, Number(subtotal || 0));
   if (!result.valid) {
@@ -783,7 +1013,7 @@ app.post('/api/promo/validate', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/orders', (req: AuthenticatedRequest, res) => {
+app.post('/api/orders', async (req: AuthenticatedRequest, res) => {
   const body = req.body as {
     customerName?: string;
     customerEmail?: string;
@@ -802,13 +1032,17 @@ app.post('/api/orders', (req: AuthenticatedRequest, res) => {
 
   if (
     !body.customerName?.trim() ||
-    !body.customerEmail?.trim() ||
     !body.customerPhone?.trim() ||
     !body.shippingAddress?.trim() ||
-    !body.city?.trim() ||
-    !body.postalCode?.trim()
+    !body.city?.trim()
   ) {
     res.status(400).json({ error: 'Please complete all shipping and contact fields.' });
+    return;
+  }
+
+  const customerEmail = body.customerEmail?.trim().toLowerCase() || '';
+  if (customerEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail)) {
+    res.status(400).json({ error: 'Please enter a valid email address or leave it empty.' });
     return;
   }
 
@@ -817,26 +1051,18 @@ app.post('/api/orders', (req: AuthenticatedRequest, res) => {
     return;
   }
 
-  const paymentMethod = body.paymentMethod || 'card';
-  let paymentLast4: string | null = null;
-
-  if (paymentMethod === 'card') {
-    const cleanCard = (body.cardNumber || '').replace(/\D/g, '');
-    if (!isValidLuhn(cleanCard)) {
-      res.status(400).json({ error: 'Card verification failed. Please enter a valid card number.' });
-      return;
-    }
-    if (!body.cardExpiry?.match(/^\d{2}\/\d{2}$/) || !body.cardCvc?.match(/^\d{3,4}$/)) {
-      res.status(400).json({ error: 'Please enter a valid expiration date (MM/YY) and security code.' });
-      return;
-    }
-    paymentLast4 = cleanCard.slice(-4);
-  } else if (paymentMethod === 'wallet') {
-    paymentLast4 = 'PAY1';
+  const paymentMethod = body.paymentMethod || 'cod';
+  if (paymentMethod !== 'cod') {
+    res.status(400).json({
+      error: 'Card and wallet payments are not enabled. Please choose cash on delivery.',
+    });
+    return;
   }
 
+  const activeSales = await getActiveFlashSales();
+  let createdOrderId: string;
   try {
-    const createdOrderId = db.transaction(() => {
+    createdOrderId = await db.transaction(async (tx) => {
       let subtotal = 0;
       const resolvedItems: Array<{
         productId: string;
@@ -847,26 +1073,25 @@ app.post('/api/orders', (req: AuthenticatedRequest, res) => {
         unitPrice: number;
       }> = [];
 
-      const selectProd = db.prepare('SELECT * FROM products WHERE id = ? AND active = 1');
-      const decrementStock = db.prepare(
+      const selectProd = tx.prepare('SELECT * FROM products WHERE id = ? AND active = 1 FOR UPDATE');
+      const decrementStock = tx.prepare(
         'UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ? AND stock >= ?'
       );
       const now = new Date().toISOString();
 
-      const activeSales = getActiveFlashSales();
       for (const item of body.items!) {
         const qty = Math.floor(Number(item.quantity));
-        if (qty <= 0) throw new Error('Invalid item quantity.');
-        const row = selectProd.get(item.productId) as Record<string, unknown> | undefined;
-        if (!row) throw new Error(`Product ${item.productId} is no longer available.`);
+        if (qty <= 0) throw new CheckoutError('Invalid item quantity.');
+        const row = (await selectProd.get(item.productId)) as Record<string, unknown> | undefined;
+        if (!row) throw new CheckoutError(`Product ${item.productId} is no longer available.`);
         const prod = applyFlashSaleToProduct(mapProductRow(row), activeSales);
         if (prod.stock < qty) {
-          throw new Error(`Insufficient stock for ${prod.name} (only ${prod.stock} left).`);
+          throw new CheckoutError(`Insufficient stock for ${prod.name} (only ${prod.stock} left).`);
         }
 
-        const updateRes = decrementStock.run(qty, now, prod.id, qty);
+        const updateRes = await decrementStock.run(qty, now, prod.id, qty);
         if (updateRes.changes === 0) {
-          throw new Error(`Stock changed for ${prod.name}. Please retry.`);
+          throw new CheckoutError(`Stock changed for ${prod.name}. Please retry.`);
         }
 
         subtotal += prod.price * qty;
@@ -887,15 +1112,11 @@ app.post('/api/orders', (req: AuthenticatedRequest, res) => {
       const total = Number((discountedSubtotal + shippingCost + taxAmount).toFixed(2));
 
       const orderId = `ord_${crypto.randomUUID().slice(0, 12)}`;
-      const countRow = db.prepare('SELECT COUNT(*) as c FROM orders').get() as { c: number };
-      const orderNumber = `SBS-${1041 + countRow.c}`;
-      const transactionRef =
-        paymentMethod === 'cod'
-          ? `COD-${crypto.randomBytes(4).toString('hex').toUpperCase()}`
-          : `TXN-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-      const paymentStatus = paymentMethod === 'cod' ? 'pending_cod' : 'paid';
+      const orderNumber = `SBS-${Date.now()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+      const transactionRef = `COD-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+      const paymentStatus = 'pending_cod';
 
-      db.prepare(
+      await tx.prepare(
         `
         INSERT INTO orders (
           id, order_number, user_id, customer_name, customer_email, customer_phone,
@@ -909,14 +1130,14 @@ app.post('/api/orders', (req: AuthenticatedRequest, res) => {
         orderNumber,
         req.authUser?.id || null,
         body.customerName!.trim(),
-        body.customerEmail!.trim().toLowerCase(),
+        customerEmail,
         body.customerPhone!.trim(),
         body.shippingAddress!.trim(),
         body.city!.trim(),
-        body.postalCode!.trim(),
+        body.postalCode?.trim() || '',
         paymentMethod,
         paymentStatus,
-        paymentLast4,
+        null,
         transactionRef,
         Number(subtotal.toFixed(2)),
         shippingCost,
@@ -929,14 +1150,14 @@ app.post('/api/orders', (req: AuthenticatedRequest, res) => {
         now
       );
 
-      const insertOrderItem = db.prepare(`
+      const insertOrderItem = tx.prepare(`
         INSERT INTO order_items (
           id, order_id, product_id, product_name, sku, variant_label, quantity, unit_price, line_total
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       for (const ri of resolvedItems) {
-        insertOrderItem.run(
+        await insertOrderItem.run(
           `oi_${crypto.randomUUID().slice(0, 10)}`,
           orderId,
           ri.productId,
@@ -950,78 +1171,85 @@ app.post('/api/orders', (req: AuthenticatedRequest, res) => {
       }
 
       return orderId;
-    })();
-
-    const order = getOrderWithItems(createdOrderId);
-    res.status(201).json({ order });
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Checkout failed.';
-    res.status(400).json({ error: message });
+    if (error instanceof CheckoutError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    throw error;
   }
+
+  const order = await getOrderWithItems(createdOrderId);
+  res.status(201).json({ order });
 });
 
-app.post('/api/orders/track', (req, res) => {
+app.post('/api/orders/track', async (req, res) => {
   const { orderNumber, email } = req.body as { orderNumber?: string; email?: string };
-  if (!orderNumber || !email) {
-    res.status(400).json({ error: 'Order number and email are required.' });
+  if (!orderNumber?.trim()) {
+    res.status(400).json({ error: 'Order number is required.' });
     return;
   }
-
-  const row = db
-    .prepare(
-      'SELECT id FROM orders WHERE UPPER(order_number) = UPPER(?) AND LOWER(customer_email) = LOWER(?)'
-    )
-    .get(orderNumber.trim(), email.trim()) as { id: string } | undefined;
+  const cleanEmail = email?.trim();
+  const row = cleanEmail
+    ? (await db.prepare(
+        'SELECT id FROM orders WHERE UPPER(order_number) = UPPER(?) AND LOWER(customer_email) = LOWER(?)'
+      ).get(orderNumber.trim(), cleanEmail.toLowerCase())) as { id: string } | undefined
+    : (await db.prepare(
+        'SELECT id FROM orders WHERE UPPER(order_number) = UPPER(?)'
+      ).get(orderNumber.trim())) as { id: string } | undefined;
 
   if (!row) {
     res.status(404).json({ error: 'No matching order found for that order number and email.' });
     return;
   }
 
-  res.json({ order: getOrderWithItems(row.id) });
+  res.json({ order: await getOrderWithItems(row.id) });
 });
 
-app.get('/api/orders/track', (req, res) => {
+app.get('/api/orders/track', async (req, res) => {
   const orderNumber = typeof req.query.orderNumber === 'string' ? req.query.orderNumber : '';
   const email = typeof req.query.email === 'string' ? req.query.email : '';
-  if (!orderNumber || !email) {
-    res.status(400).json({ error: 'Order number and email are required.' });
+  if (!orderNumber.trim()) {
+    res.status(400).json({ error: 'Order number is required.' });
     return;
   }
-
-  const row = db
-    .prepare(
-      'SELECT id FROM orders WHERE UPPER(order_number) = UPPER(?) AND LOWER(customer_email) = LOWER(?)'
-    )
-    .get(orderNumber.trim(), email.trim()) as { id: string } | undefined;
+  const cleanEmail = email.trim();
+  const row = cleanEmail
+    ? (await db.prepare(
+        'SELECT id FROM orders WHERE UPPER(order_number) = UPPER(?) AND LOWER(customer_email) = LOWER(?)'
+      ).get(orderNumber.trim(), cleanEmail.toLowerCase())) as { id: string } | undefined
+    : (await db.prepare(
+        'SELECT id FROM orders WHERE UPPER(order_number) = UPPER(?)'
+      ).get(orderNumber.trim())) as { id: string } | undefined;
 
   if (!row) {
     res.status(404).json({ error: 'No matching order found for that order number and email.' });
     return;
   }
 
-  res.json({ order: getOrderWithItems(row.id) });
+  res.json({ order: await getOrderWithItems(row.id) });
 });
 
-app.get('/api/orders/my', requireAuth, (req: AuthenticatedRequest, res) => {
-  const rows = db
+app.get('/api/orders/my', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const rows = (await db
     .prepare(
       'SELECT id FROM orders WHERE user_id = ? OR LOWER(customer_email) = LOWER(?) ORDER BY created_at DESC'
     )
-    .all(req.authUser!.id, req.authUser!.email) as { id: string }[];
+    .all(req.authUser!.id, req.authUser!.email)) as { id: string }[];
 
-  const orders = rows.map((r) => getOrderWithItems(r.id)).filter(Boolean);
+  const orders = (await Promise.all(rows.map((r) => getOrderWithItems(r.id)))).filter(Boolean);
   res.json({ orders });
 });
 
 // ==================== ADMIN & RBAC ENDPOINTS ====================
 
-app.get('/api/admin/overview', requirePermission('analytics:read'), (_req, res) => {
-  const orders = db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all() as Record<
+app.get('/api/admin/overview', requirePermission('analytics:read'), async (_req, res) => {
+  const orders = (await db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all()) as Record<
     string,
     unknown
   >[];
-  const products = db.prepare('SELECT * FROM products').all() as Record<string, unknown>[];
+  const products = (await db.prepare('SELECT * FROM products').all()) as Record<string, unknown>[];
 
   const validOrders = orders.filter((o) => o.payment_status !== 'refunded' && o.order_status !== 'cancelled');
   const grossRevenue = validOrders.reduce((sum, o) => sum + Number(o.total), 0);
@@ -1071,7 +1299,7 @@ app.get('/api/admin/overview', requirePermission('analytics:read'), (_req, res) 
   }));
 
   // Category revenue mix
-  const catRows = db
+  const catRows = (await db
     .prepare(
       `
       SELECT p.category, SUM(oi.line_total) as total
@@ -1081,10 +1309,10 @@ app.get('/api/admin/overview', requirePermission('analytics:read'), (_req, res) 
       ORDER BY total DESC
     `
     )
-    .all() as Array<{ category: string; total: number }>;
+    .all()) as Array<{ category: string; total: number }>;
 
   // Top selling products
-  const topProducts = db
+  const topProducts = (await db
     .prepare(
       `
       SELECT
@@ -1101,7 +1329,7 @@ app.get('/api/admin/overview', requirePermission('analytics:read'), (_req, res) 
       LIMIT 5
     `
     )
-    .all() as Array<{
+    .all()) as Array<{
     productId: string;
     productName: string;
     sku: string;
@@ -1124,7 +1352,11 @@ app.get('/api/admin/overview', requirePermission('analytics:read'), (_req, res) 
       retailValue: Number(retailValue.toFixed(2)),
       outOfStockCount: outOfStockProducts.length,
       lowStockCount: lowStockProducts.length,
-      waitlistCount: (db.prepare('SELECT count(*) as c FROM stock_waitlist').get() as { c: number }).c,
+      waitlistCount: Number(
+        ((await db.prepare('SELECT count(*) as c FROM stock_waitlist').get()) as
+          | { c: number }
+          | undefined)?.c ?? 0
+      ),
     },
     orderStatusBreakdown,
     topProducts,
@@ -1134,7 +1366,7 @@ app.get('/api/admin/overview', requirePermission('analytics:read'), (_req, res) 
   });
 });
 
-app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) => {
+app.get('/api/admin/analytics', requirePermission('analytics:read'), async (req, res) => {
   const rawRange = typeof req.query.range === 'string' ? req.query.range.toLowerCase() : '30d';
   const range: '7d' | '30d' | '90d' | '12m' =
     rawRange === '7d' || rawRange === '30d' || rawRange === '90d' || rawRange === '12m'
@@ -1146,10 +1378,10 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
   const cutoffMs = nowMs - rangeDays * 86400_000;
   const cutoffIso = new Date(cutoffMs).toISOString();
 
-  const orders = db.prepare('SELECT * FROM orders ORDER BY created_at ASC').all() as Array<
+  const orders = (await db.prepare('SELECT * FROM orders ORDER BY created_at ASC').all()) as Array<
     Record<string, unknown>
   >;
-  const orderItems = db
+  const orderItems = (await db
     .prepare(
       `
       SELECT oi.order_id, oi.product_id, oi.quantity, oi.line_total, p.category
@@ -1157,7 +1389,7 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
       LEFT JOIN products p ON oi.product_id = p.id
     `
     )
-    .all() as Array<{
+    .all()) as Array<{
     order_id: string;
     product_id: string;
     quantity: number;
@@ -1165,7 +1397,7 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
     category: string | null;
   }>;
 
-  const productsRaw = db.prepare('SELECT * FROM products').all() as Array<Record<string, unknown>>;
+  const productsRaw = (await db.prepare('SELECT * FROM products').all()) as Array<Record<string, unknown>>;
   const mappedProducts = productsRaw.map(mapProductRow);
 
   // Map order_id -> items
@@ -1276,7 +1508,8 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
     string,
     { revenue: number; unitsSold: number; orderIds: Set<string> }
   >();
-  for (const cat of ALLOWED_PRODUCT_CATEGORIES) {
+  const allowedAnalyticsCategories = await getAllowedProductCategories();
+  for (const cat of allowedAnalyticsCategories) {
     categorySalesMap.set(cat, { revenue: 0, unitsSold: 0, orderIds: new Set() });
   }
 
@@ -1304,7 +1537,7 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
     for (const it of items) {
       const qty = Number(it.quantity || 0);
       const lineTotal = Number(it.line_total || 0);
-      const cat = it.category || 'Accessories';
+      const cat = it.category || 'Uncategorized';
 
       const catEntry = categorySalesMap.get(cat) || {
         revenue: 0,
@@ -1339,7 +1572,7 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
     }))
     .sort((a, b) => b.revenue - a.revenue);
 
-  const inventoryTurnover = ALLOWED_PRODUCT_CATEGORIES.map((category) => {
+  const inventoryTurnover = allowedAnalyticsCategories.map((category) => {
     const catProducts = mappedProducts.filter((p) => p.active && p.category === category);
     const currentStock = catProducts.reduce((sum, p) => sum + Math.max(0, p.stock), 0);
     const stockValue = catProducts.reduce((sum, p) => sum + Math.max(0, p.stock) * p.price, 0);
@@ -1420,7 +1653,7 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
           : 0,
       avgTurnoverRate,
       sellThroughPct,
-      topCategory: topCategories[0]?.category || 'Consoles',
+      topCategory: topCategories[0]?.category || '',
     },
     salesTrend: buckets.map((b) => ({
       label: b.label,
@@ -1435,15 +1668,15 @@ app.get('/api/admin/analytics', requirePermission('analytics:read'), (req, res) 
   });
 });
 
-app.get('/api/admin/restock-waitlist', requirePermission('products:read'), (_req, res) => {
-  const rows = db
+app.get('/api/admin/restock-waitlist', requirePermission('products:read'), async (_req, res) => {
+  const rows = await db
     .prepare('SELECT * FROM stock_waitlist ORDER BY created_at DESC')
     .all() as Record<string, unknown>[];
   res.json({ waitlist: rows.map(mapWaitlistRow) });
 });
 
-app.get('/api/admin/reviews', requirePermission('products:read'), (_req, res) => {
-  const rows = db
+app.get('/api/admin/reviews', requirePermission('products:read'), async (_req, res) => {
+  const rows = await db
     .prepare('SELECT * FROM product_reviews ORDER BY created_at DESC')
     .all() as Record<string, unknown>[];
   const reviews = rows.map(mapReviewRow);
@@ -1458,8 +1691,8 @@ app.get('/api/admin/reviews', requirePermission('products:read'), (_req, res) =>
   });
 });
 
-app.delete('/api/admin/reviews/:id', requirePermission('products:write'), (req: AuthenticatedRequest, res) => {
-  const row = db
+app.delete('/api/admin/reviews/:id', requirePermission('products:write'), async (req: AuthenticatedRequest, res) => {
+  const row = await db
     .prepare('SELECT id, product_id, product_name, author_name, rating FROM product_reviews WHERE id = ?')
     .get(req.params.id) as { id: string; product_id: string; product_name: string; author_name: string; rating: number } | undefined;
 
@@ -1468,9 +1701,9 @@ app.delete('/api/admin/reviews/:id', requirePermission('products:write'), (req: 
     return;
   }
 
-  db.prepare('DELETE FROM product_reviews WHERE id = ?').run(row.id);
+  await db.prepare('DELETE FROM product_reviews WHERE id = ?').run(row.id);
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -1482,31 +1715,31 @@ app.delete('/api/admin/reviews/:id', requirePermission('products:write'), (req: 
   res.json({ ok: true });
 });
 
-app.get('/api/admin/products', requirePermission('products:read'), (_req, res) => {
-  const rows = db.prepare('SELECT * FROM products ORDER BY created_at DESC').all() as Record<
+app.get('/api/admin/products', requirePermission('products:read'), async (_req, res) => {
+  const rows = await db.prepare('SELECT * FROM products ORDER BY created_at DESC').all() as Record<
     string,
     unknown
   >[];
-  res.json({
-    products: rows.map((row) => {
+  const products = await Promise.all(
+    rows.map(async (row) => {
       const mapped = mapProductRow(row);
-      const summary = computeRatingSummary(mapped.id);
+      const summary = await computeRatingSummary(mapped.id);
       return {
         ...mapped,
         averageRating: summary.averageRating,
         reviewCount: summary.reviewCount,
       };
-    }),
-  });
+    })
+  );
+  res.json({ products });
 });
 
-const ALLOWED_PRODUCT_CATEGORIES = [
-  'Consoles',
-  'Monitors',
-  'Audio',
-  'Peripherals',
-  'Accessories',
-];
+async function getAllowedProductCategories(): Promise<string[]> {
+  const rows = (await db
+    .prepare('SELECT name FROM store_categories WHERE active = 1 ORDER BY sort_order ASC, name ASC')
+    .all()) as Array<{ name: string }>;
+  return rows.map((row) => row.name);
+}
 
 function isValidMediaUrl(url: string): boolean {
   return (
@@ -1517,7 +1750,7 @@ function isValidMediaUrl(url: string): boolean {
   );
 }
 
-app.post('/api/admin/products', requirePermission('products:write'), (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/products', requirePermission('products:write'), async (req: AuthenticatedRequest, res) => {
   const b = req.body as {
     sku?: string;
     slug?: string;
@@ -1562,7 +1795,8 @@ app.post('/api/admin/products', requirePermission('products:write'), (req: Authe
     return;
   }
 
-  if (!b.category || !ALLOWED_PRODUCT_CATEGORIES.includes(b.category)) {
+  const allowedCategories = await getAllowedProductCategories();
+  if (!b.category || !allowedCategories.includes(b.category)) {
     res.status(400).json({ error: 'Please select a valid hardware category.' });
     return;
   }
@@ -1606,7 +1840,7 @@ app.post('/api/admin/products', requirePermission('products:write'), (req: Authe
     return;
   }
 
-  const duplicateSku = db.prepare('SELECT id FROM products WHERE UPPER(sku) = ?').get(cleanSku);
+  const duplicateSku = await db.prepare('SELECT id FROM products WHERE UPPER(sku) = ?').get(cleanSku);
   if (duplicateSku) {
     res.status(409).json({ error: `A product with SKU "${cleanSku}" already exists.` });
     return;
@@ -1659,11 +1893,11 @@ app.post('/api/admin/products', requirePermission('products:write'), (req: Authe
     b.condition === 'Refurbished' || b.condition === 'Open Box' ? b.condition : 'New';
 
   try {
-    db.prepare(
+    await db.prepare(
       `
       INSERT INTO products (
         id, sku, slug, name, brand, category, price, compare_at_price, cost_price, stock,
-        low_stock_threshold, condition, warranty, weight, dimensions, whats_in_box, tags,
+        low_stock_threshold, \`condition\`, warranty, weight, dimensions, whats_in_box, tags,
         badge, tagline, description, specs, variants,
         visual_key, image_url, images, featured, active, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1708,7 +1942,7 @@ app.post('/api/admin/products', requirePermission('products:write'), (req: Authe
       now
     );
 
-    logAudit(
+    await logAudit(
       req.authUser!.id,
       req.authUser!.name,
       req.authUser!.roleName,
@@ -1718,7 +1952,7 @@ app.post('/api/admin/products', requirePermission('products:write'), (req: Authe
       `Created ${cleanName} (${cleanSku}) at $${priceNum} with ${cleanImages.length} image(s)`
     );
 
-    const created = db.prepare('SELECT * FROM products WHERE id = ?').get(id) as Record<
+    const created = await db.prepare('SELECT * FROM products WHERE id = ?').get(id) as Record<
       string,
       unknown
     >;
@@ -1728,8 +1962,8 @@ app.post('/api/admin/products', requirePermission('products:write'), (req: Authe
   }
 });
 
-app.patch('/api/admin/products/:id', requirePermission('products:write'), (req: AuthenticatedRequest, res) => {
-  const existingRow = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id) as
+app.patch('/api/admin/products/:id', requirePermission('products:write'), async (req: AuthenticatedRequest, res) => {
+  const existingRow = await db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
   if (!existingRow) {
@@ -1774,7 +2008,8 @@ app.patch('/api/admin/products/:id', requirePermission('products:write'), (req: 
   }>;
 
   if (b.category !== undefined) {
-    if (!ALLOWED_PRODUCT_CATEGORIES.includes(b.category)) {
+    const allowedCategories = await getAllowedProductCategories();
+    if (!allowedCategories.includes(b.category)) {
       res.status(400).json({ error: 'Invalid hardware category selected.' });
       return;
     }
@@ -1878,11 +2113,11 @@ app.patch('/api/admin/products/:id', requirePermission('products:write'), (req: 
   }
 
   const now = new Date().toISOString();
-  db.prepare(
+  await db.prepare(
     `
     UPDATE products SET
       name = ?, brand = ?, category = ?, price = ?, compare_at_price = ?, cost_price = ?,
-      stock = ?, low_stock_threshold = ?, condition = ?, warranty = ?, weight = ?, dimensions = ?,
+      stock = ?, low_stock_threshold = ?, \`condition\` = ?, warranty = ?, weight = ?, dimensions = ?,
       whats_in_box = ?, tags = ?, badge = ?, tagline = ?, description = ?,
       specs = ?, variants = ?, visual_key = ?,
       featured = ?, active = ?, image_url = ?, images = ?, updated_at = ?
@@ -1929,7 +2164,7 @@ app.patch('/api/admin/products/:id', requirePermission('products:write'), (req: 
     existing.id
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -1939,15 +2174,15 @@ app.patch('/api/admin/products/:id', requirePermission('products:write'), (req: 
     `Updated ${existing.sku} (stock: ${nextStock}, price: $${nextPrice})`
   );
 
-  const updated = db.prepare('SELECT * FROM products WHERE id = ?').get(existing.id) as Record<
+  const updated = await db.prepare('SELECT * FROM products WHERE id = ?').get(existing.id) as Record<
     string,
     unknown
   >;
   res.json({ product: mapProductRow(updated) });
 });
 
-app.delete('/api/admin/products/:id', requirePermission('products:delete'), (req: AuthenticatedRequest, res) => {
-  const existing = db.prepare('SELECT id, name, sku FROM products WHERE id = ?').get(req.params.id) as
+app.delete('/api/admin/products/:id', requirePermission('products:delete'), async (req: AuthenticatedRequest, res) => {
+  const existing = await db.prepare('SELECT id, name, sku FROM products WHERE id = ?').get(req.params.id) as
     | { id: string; name: string; sku: string }
     | undefined;
   if (!existing) {
@@ -1955,8 +2190,8 @@ app.delete('/api/admin/products/:id', requirePermission('products:delete'), (req
     return;
   }
 
-  db.prepare('DELETE FROM products WHERE id = ?').run(existing.id);
-  logAudit(
+  await db.prepare('DELETE FROM products WHERE id = ?').run(existing.id);
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -1968,16 +2203,16 @@ app.delete('/api/admin/products/:id', requirePermission('products:delete'), (req
   res.json({ ok: true });
 });
 
-app.get('/api/admin/orders', requirePermission('orders:read'), (_req, res) => {
-  const rows = db.prepare('SELECT id FROM orders ORDER BY created_at DESC').all() as { id: string }[];
-  const orders = rows.map((r) => getOrderWithItems(r.id)).filter(Boolean);
+app.get('/api/admin/orders', requirePermission('orders:read'), async (_req, res) => {
+  const rows = await db.prepare('SELECT id FROM orders ORDER BY created_at DESC').all() as { id: string }[];
+  const orders = (await Promise.all(rows.map((r) => getOrderWithItems(r.id)))).filter(Boolean);
   res.json({ orders });
 });
 
 app.patch(
   '/api/admin/orders/:id/status',
   requirePermission('orders:manage'),
-  (req: AuthenticatedRequest, res) => {
+  async (req: AuthenticatedRequest, res) => {
     const { orderStatus } = req.body as { orderStatus?: string };
     const allowed = ['confirmed', 'packed', 'shipped', 'delivered', 'cancelled'];
     if (!orderStatus || !allowed.includes(orderStatus)) {
@@ -1985,20 +2220,20 @@ app.patch(
       return;
     }
 
-    const existing = getOrderWithItems(req.params.id);
+    const existing = await getOrderWithItems(req.params.id);
     if (!existing) {
       res.status(404).json({ error: 'Order not found.' });
       return;
     }
 
     const now = new Date().toISOString();
-    db.prepare('UPDATE orders SET order_status = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE orders SET order_status = ?, updated_at = ? WHERE id = ?').run(
       orderStatus,
       now,
       existing.id
     );
 
-    logAudit(
+    await logAudit(
       req.authUser!.id,
       req.authUser!.name,
       req.authUser!.roleName,
@@ -2008,15 +2243,15 @@ app.patch(
       `Moved order ${existing.orderNumber} from ${existing.orderStatus} to ${orderStatus}`
     );
 
-    res.json({ order: getOrderWithItems(existing.id) });
+    res.json({ order: await getOrderWithItems(existing.id) });
   }
 );
 
 app.post(
   '/api/admin/orders/:id/refund',
   requirePermission('orders:refund'),
-  (req: AuthenticatedRequest, res) => {
-    const existing = getOrderWithItems(req.params.id);
+  async (req: AuthenticatedRequest, res) => {
+    const existing = await getOrderWithItems(req.params.id);
     if (!existing) {
       res.status(404).json({ error: 'Order not found.' });
       return;
@@ -2036,11 +2271,11 @@ app.post(
     }
 
     const now = new Date().toISOString();
-    db.prepare(
+    await db.prepare(
       "UPDATE orders SET payment_status = 'refunded', order_status = 'cancelled', updated_at = ? WHERE id = ?"
     ).run(now, existing.id);
 
-    logAudit(
+    await logAudit(
       req.authUser!.id,
       req.authUser!.name,
       req.authUser!.roleName,
@@ -2050,11 +2285,11 @@ app.post(
       `Refunded $${existing.total.toFixed(2)} for ${existing.orderNumber} (${existing.transactionRef})`
     );
 
-    res.json({ order: getOrderWithItems(existing.id) });
+    res.json({ order: await getOrderWithItems(existing.id) });
   }
 );
 
-app.get('/api/admin/roles', requireAuth, (req: AuthenticatedRequest, res) => {
+app.get('/api/admin/roles', requireAuth, async (req: AuthenticatedRequest, res) => {
   const hasAccess =
     req.authUser!.permissions.includes('staff:read') ||
     req.authUser!.permissions.includes('roles:manage');
@@ -2062,14 +2297,14 @@ app.get('/api/admin/roles', requireAuth, (req: AuthenticatedRequest, res) => {
     res.status(403).json({ error: 'Insufficient permissions to view roles.' });
     return;
   }
-  const rows = db.prepare('SELECT * FROM roles ORDER BY is_system DESC, name ASC').all() as Record<
+  const rows = await db.prepare('SELECT * FROM roles ORDER BY is_system DESC, name ASC').all() as Record<
     string,
     unknown
   >[];
   res.json({ roles: rows.map(mapRoleRow) });
 });
 
-app.post('/api/admin/roles', requirePermission('roles:manage'), (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/roles', requirePermission('roles:manage'), async (req: AuthenticatedRequest, res) => {
   const { name, description, permissions, maxDiscountPct, maxRefundAmount } = req.body as {
     name?: string;
     description?: string;
@@ -2091,7 +2326,7 @@ app.post('/api/admin/roles', requirePermission('roles:manage'), (req: Authentica
     .replace(/^-|-$/g, '');
   const now = new Date().toISOString();
 
-  db.prepare(
+  await db.prepare(
     `
     INSERT INTO roles (id, name, slug, description, permissions, max_discount_pct, max_refund_amount, is_system, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
@@ -2107,7 +2342,7 @@ app.post('/api/admin/roles', requirePermission('roles:manage'), (req: Authentica
     now
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2117,12 +2352,12 @@ app.post('/api/admin/roles', requirePermission('roles:manage'), (req: Authentica
     `Created custom role '${name.trim()}' with ${(permissions || []).length} permissions.`
   );
 
-  const row = db.prepare('SELECT * FROM roles WHERE id = ?').get(id) as Record<string, unknown>;
+  const row = await db.prepare('SELECT * FROM roles WHERE id = ?').get(id) as Record<string, unknown>;
   res.status(201).json({ role: mapRoleRow(row) });
 });
 
-app.patch('/api/admin/roles/:id', requirePermission('roles:manage'), (req: AuthenticatedRequest, res) => {
-  const existingRow = db.prepare('SELECT * FROM roles WHERE id = ?').get(req.params.id) as
+app.patch('/api/admin/roles/:id', requirePermission('roles:manage'), async (req: AuthenticatedRequest, res) => {
+  const existingRow = await db.prepare('SELECT * FROM roles WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
   if (!existingRow) {
@@ -2144,7 +2379,7 @@ app.patch('/api/admin/roles/:id', requirePermission('roles:manage'), (req: Authe
     maxRefundAmount?: number;
   };
 
-  db.prepare(
+  await db.prepare(
     `
     UPDATE roles SET name = ?, description = ?, permissions = ?, max_discount_pct = ?, max_refund_amount = ?
     WHERE id = ?
@@ -2158,7 +2393,7 @@ app.patch('/api/admin/roles/:id', requirePermission('roles:manage'), (req: Authe
     existing.id
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2168,15 +2403,15 @@ app.patch('/api/admin/roles/:id', requirePermission('roles:manage'), (req: Authe
     `Updated permissions and caps for role '${name || existing.name}'.`
   );
 
-  const updated = db.prepare('SELECT * FROM roles WHERE id = ?').get(existing.id) as Record<
+  const updated = await db.prepare('SELECT * FROM roles WHERE id = ?').get(existing.id) as Record<
     string,
     unknown
   >;
   res.json({ role: mapRoleRow(updated) });
 });
 
-app.get('/api/admin/staff', requirePermission('staff:read'), (_req, res) => {
-  const rows = db
+app.get('/api/admin/staff', requirePermission('staff:read'), async (_req, res) => {
+  const rows = await db
     .prepare(
       `
       SELECT
@@ -2215,7 +2450,7 @@ app.get('/api/admin/staff', requirePermission('staff:read'), (_req, res) => {
   res.json({ staff });
 });
 
-app.post('/api/admin/staff', requirePermission('staff:manage'), (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/staff', requirePermission('staff:manage'), async (req: AuthenticatedRequest, res) => {
   const { name, email, password, roleId, departmentScope, customPermissions } = req.body as {
     name?: string;
     email?: string;
@@ -2230,7 +2465,7 @@ app.post('/api/admin/staff', requirePermission('staff:manage'), (req: Authentica
     return;
   }
 
-  const existing = db
+  const existing = await db
     .prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)')
     .get(email.trim());
   if (existing) {
@@ -2238,7 +2473,7 @@ app.post('/api/admin/staff', requirePermission('staff:manage'), (req: Authentica
     return;
   }
 
-  const role = db.prepare('SELECT id, name FROM roles WHERE id = ?').get(roleId) as
+  const role = await db.prepare('SELECT id, name FROM roles WHERE id = ?').get(roleId) as
     | { id: string; name: string }
     | undefined;
   if (!role) {
@@ -2248,7 +2483,7 @@ app.post('/api/admin/staff', requirePermission('staff:manage'), (req: Authentica
 
   const id = `usr_${crypto.randomUUID().slice(0, 10)}`;
   const now = new Date().toISOString();
-  db.prepare(
+  await db.prepare(
     `
     INSERT INTO users (id, name, email, password_hash, role_id, custom_permissions, department_scope, status, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
@@ -2264,7 +2499,7 @@ app.post('/api/admin/staff', requirePermission('staff:manage'), (req: Authentica
     now
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2274,11 +2509,11 @@ app.post('/api/admin/staff', requirePermission('staff:manage'), (req: Authentica
     `Added employee ${name.trim()} (${email.trim()}) as ${role.name} [scope: ${departmentScope || 'all'}]`
   );
 
-  res.status(201).json({ user: loadUserById(id) });
+  res.status(201).json({ user: await loadUserById(id) });
 });
 
-app.patch('/api/admin/staff/:id', requirePermission('staff:manage'), (req: AuthenticatedRequest, res) => {
-  const target = loadUserById(req.params.id);
+app.patch('/api/admin/staff/:id', requirePermission('staff:manage'), async (req: AuthenticatedRequest, res) => {
+  const target = await loadUserById(req.params.id);
   if (!target) {
     res.status(404).json({ error: 'Employee not found.' });
     return;
@@ -2303,7 +2538,7 @@ app.patch('/api/admin/staff/:id', requirePermission('staff:manage'), (req: Authe
   }
 
   if (password && password.trim().length >= 6) {
-    db.prepare(
+    await db.prepare(
       `
       UPDATE users SET
         name = ?,
@@ -2326,7 +2561,7 @@ app.patch('/api/admin/staff/:id', requirePermission('staff:manage'), (req: Authe
       target.id
     );
   } else {
-    db.prepare(
+    await db.prepare(
       `
       UPDATE users SET
         name = ?,
@@ -2348,7 +2583,7 @@ app.patch('/api/admin/staff/:id', requirePermission('staff:manage'), (req: Authe
     );
   }
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2358,11 +2593,11 @@ app.patch('/api/admin/staff/:id', requirePermission('staff:manage'), (req: Authe
     `Updated ${name?.trim() || target.name}: role=${roleId ?? target.roleId}, status=${status ?? target.status}, scope=${departmentScope ?? target.departmentScope}${password ? ' (password reset)' : ''}`
   );
 
-  res.json({ user: loadUserById(target.id) });
+  res.json({ user: await loadUserById(target.id) });
 });
 
-app.delete('/api/admin/staff/:id', requirePermission('staff:manage'), (req: AuthenticatedRequest, res) => {
-  const target = loadUserById(req.params.id);
+app.delete('/api/admin/staff/:id', requirePermission('staff:manage'), async (req: AuthenticatedRequest, res) => {
+  const target = await loadUserById(req.params.id);
   if (!target) {
     res.status(404).json({ error: 'Employee not found.' });
     return;
@@ -2376,8 +2611,8 @@ app.delete('/api/admin/staff/:id', requirePermission('staff:manage'), (req: Auth
     return;
   }
 
-  db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
-  logAudit(
+  await db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2389,20 +2624,20 @@ app.delete('/api/admin/staff/:id', requirePermission('staff:manage'), (req: Auth
   res.json({ ok: true });
 });
 
-app.get('/api/admin/audit-logs', requirePermission('audit:read'), (_req, res) => {
-  const rows = db
+app.get('/api/admin/audit-logs', requirePermission('audit:read'), async (_req, res) => {
+  const rows = await db
     .prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 60')
     .all() as Record<string, unknown>[];
   res.json({ logs: rows.map(mapAuditRow) });
 });
 
-app.get('/api/admin/notifications', requireAuth, (req: AuthenticatedRequest, res) => {
+app.get('/api/admin/notifications', requireAuth, async (req: AuthenticatedRequest, res) => {
   if (req.authUser!.roleSlug === 'customer') {
     res.status(403).json({ error: 'Staff access required.' });
     return;
   }
   const perms = req.authUser!.permissions;
-  const rows = db
+  const rows = await db
     .prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 25')
     .all() as Record<string, unknown>[];
 
@@ -2426,7 +2661,7 @@ app.get('/api/admin/notifications', requireAuth, (req: AuthenticatedRequest, res
   res.json({ notifications: mapped });
 });
 
-app.patch('/api/admin/settings', requirePermission('roles:manage'), (req: AuthenticatedRequest, res) => {
+app.patch('/api/admin/settings', requirePermission('roles:manage'), async (req: AuthenticatedRequest, res) => {
   const { whatsappNumber, storeName, logoUrl } = req.body as {
     whatsappNumber?: string;
     storeName?: string;
@@ -2436,8 +2671,8 @@ app.patch('/api/admin/settings', requirePermission('roles:manage'), (req: Authen
     res.status(400).json({ error: 'Please provide a valid WhatsApp phone number with country code.' });
     return;
   }
-  const updated = updateStoreSettings({ whatsappNumber, storeName, logoUrl });
-  logAudit(
+  const updated = await updateStoreSettings({ whatsappNumber, storeName, logoUrl });
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2451,7 +2686,7 @@ app.patch('/api/admin/settings', requirePermission('roles:manage'), (req: Authen
 
 // ==================== ADMIN CAMPAIGNS & DUAL-SIZE BANNERS ====================
 
-app.post('/api/admin/upload', requireAuth, (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/upload', requireAuth, async (req: AuthenticatedRequest, res) => {
   const hasPerm =
     req.authUser!.permissions.includes('campaigns:manage') ||
     req.authUser!.permissions.includes('products:write') ||
@@ -2486,14 +2721,14 @@ app.post('/api/admin/upload', requireAuth, (req: AuthenticatedRequest, res) => {
   res.status(201).json({ url: `/uploads/${outName}` });
 });
 
-app.get('/api/admin/campaigns', requirePermission('campaigns:manage'), (_req, res) => {
-  const rows = db
+app.get('/api/admin/campaigns', requirePermission('campaigns:manage'), async (_req, res) => {
+  const rows = await db
     .prepare('SELECT * FROM campaigns ORDER BY sort_order ASC, created_at DESC')
     .all() as Record<string, unknown>[];
   res.json({ campaigns: rows.map(mapCampaignRow) });
 });
 
-app.post('/api/admin/campaigns', requirePermission('campaigns:manage'), (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/campaigns', requirePermission('campaigns:manage'), async (req: AuthenticatedRequest, res) => {
   const b = req.body as {
     placement?: string;
     designTheme?: string;
@@ -2518,7 +2753,7 @@ app.post('/api/admin/campaigns', requirePermission('campaigns:manage'), (req: Au
 
   const id = `cmp_${crypto.randomUUID().slice(0, 10)}`;
   const now = new Date().toISOString();
-  db.prepare(
+  await db.prepare(
     `
     INSERT INTO campaigns (
       id, placement, design_theme, section_size, offer_tag, title, subtitle,
@@ -2546,7 +2781,7 @@ app.post('/api/admin/campaigns', requirePermission('campaigns:manage'), (req: Au
     now
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2556,12 +2791,12 @@ app.post('/api/admin/campaigns', requirePermission('campaigns:manage'), (req: Au
     `Created ${b.placement || 'hero'} banner "${b.title.trim()}" (${b.designTheme || 'navy'} / ${b.sectionSize || 'split'})`
   );
 
-  const row = db.prepare('SELECT * FROM campaigns WHERE id = ?').get(id) as Record<string, unknown>;
+  const row = await db.prepare('SELECT * FROM campaigns WHERE id = ?').get(id) as Record<string, unknown>;
   res.status(201).json({ campaign: mapCampaignRow(row) });
 });
 
-app.patch('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), (req: AuthenticatedRequest, res) => {
-  const existingRow = db.prepare('SELECT * FROM campaigns WHERE id = ?').get(req.params.id) as
+app.patch('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), async (req: AuthenticatedRequest, res) => {
+  const existingRow = await db.prepare('SELECT * FROM campaigns WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
   if (!existingRow) {
@@ -2587,7 +2822,7 @@ app.patch('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), (re
   }>;
 
   const now = new Date().toISOString();
-  db.prepare(
+  await db.prepare(
     `
     UPDATE campaigns SET
       placement = ?, design_theme = ?, section_size = ?, offer_tag = ?, title = ?, subtitle = ?,
@@ -2614,7 +2849,7 @@ app.patch('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), (re
     existing.id
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2624,15 +2859,15 @@ app.patch('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), (re
     `Updated banner "${b.title ?? existing.title}"`
   );
 
-  const row = db.prepare('SELECT * FROM campaigns WHERE id = ?').get(existing.id) as Record<
+  const row = await db.prepare('SELECT * FROM campaigns WHERE id = ?').get(existing.id) as Record<
     string,
     unknown
   >;
   res.json({ campaign: mapCampaignRow(row) });
 });
 
-app.delete('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), (req: AuthenticatedRequest, res) => {
-  const existing = db.prepare('SELECT id, title FROM campaigns WHERE id = ?').get(req.params.id) as
+app.delete('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), async (req: AuthenticatedRequest, res) => {
+  const existing = await db.prepare('SELECT id, title FROM campaigns WHERE id = ?').get(req.params.id) as
     | { id: string; title: string }
     | undefined;
   if (!existing) {
@@ -2640,8 +2875,8 @@ app.delete('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), (r
     return;
   }
 
-  db.prepare('DELETE FROM campaigns WHERE id = ?').run(existing.id);
-  logAudit(
+  await db.prepare('DELETE FROM campaigns WHERE id = ?').run(existing.id);
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2655,11 +2890,10 @@ app.delete('/api/admin/campaigns/:id', requirePermission('campaigns:manage'), (r
 
 // ==================== ADMIN FLASH SALES (CATEGORY TIME-BOUND DISCOUNTS) ====================
 
-const ALLOWED_FLASH_CATEGORIES = ['All', ...ALLOWED_PRODUCT_CATEGORIES];
 const ALLOWED_FLASH_THEMES = ['crimson', 'navy', 'cobalt', 'obsidian'];
 
-app.get('/api/admin/flash-sales', requirePermission('campaigns:manage'), (_req, res) => {
-  const rows = db
+app.get('/api/admin/flash-sales', requirePermission('campaigns:manage'), async (_req, res) => {
+  const rows = await db
     .prepare('SELECT * FROM flash_sales ORDER BY active DESC, expires_at DESC')
     .all() as Record<string, unknown>[];
   res.json({
@@ -2668,7 +2902,7 @@ app.get('/api/admin/flash-sales', requirePermission('campaigns:manage'), (_req, 
   });
 });
 
-app.post('/api/admin/flash-sales', requirePermission('campaigns:manage'), (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/flash-sales', requirePermission('campaigns:manage'), async (req: AuthenticatedRequest, res) => {
   const b = req.body as {
     title?: string;
     subtitle?: string;
@@ -2688,7 +2922,8 @@ app.post('/api/admin/flash-sales', requirePermission('campaigns:manage'), (req: 
     return;
   }
 
-  const targetCategory = ALLOWED_FLASH_CATEGORIES.includes(String(b.targetCategory))
+  const flashCategories = ['All', ...(await getAllowedProductCategories())];
+  const targetCategory = flashCategories.includes(String(b.targetCategory))
     ? String(b.targetCategory)
     : '';
   if (!targetCategory) {
@@ -2734,7 +2969,7 @@ app.post('/api/admin/flash-sales', requirePermission('campaigns:manage'), (req: 
   const id = `fs_${crypto.randomUUID().slice(0, 10)}`;
   const nowIso = now.toISOString();
 
-  db.prepare(
+  await db.prepare(
     `
     INSERT INTO flash_sales (
       id, title, subtitle, badge_label, target_category, discount_pct,
@@ -2757,7 +2992,7 @@ app.post('/api/admin/flash-sales', requirePermission('campaigns:manage'), (req: 
     nowIso
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2767,12 +3002,12 @@ app.post('/api/admin/flash-sales', requirePermission('campaigns:manage'), (req: 
     `Launched ${discountPct}% flash sale on ${targetCategory} ("${title}") expiring ${expiresDate.toISOString()}`
   );
 
-  const row = db.prepare('SELECT * FROM flash_sales WHERE id = ?').get(id) as Record<string, unknown>;
+  const row = await db.prepare('SELECT * FROM flash_sales WHERE id = ?').get(id) as Record<string, unknown>;
   res.status(201).json({ flashSale: mapFlashSaleRow(row) });
 });
 
-app.patch('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), (req: AuthenticatedRequest, res) => {
-  const existingRow = db.prepare('SELECT * FROM flash_sales WHERE id = ?').get(req.params.id) as
+app.patch('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), async (req: AuthenticatedRequest, res) => {
+  const existingRow = await db.prepare('SELECT * FROM flash_sales WHERE id = ?').get(req.params.id) as
     | Record<string, unknown>
     | undefined;
   if (!existingRow) {
@@ -2798,9 +3033,10 @@ app.patch('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), (
     return;
   }
 
+  const flashCategories = ['All', ...(await getAllowedProductCategories())];
   const nextCategory =
     b.targetCategory !== undefined
-      ? ALLOWED_FLASH_CATEGORIES.includes(b.targetCategory)
+      ? flashCategories.includes(b.targetCategory)
         ? b.targetCategory
         : ''
       : existing.targetCategory;
@@ -2838,7 +3074,7 @@ app.patch('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), (
       : existing.designTheme;
 
   const nowIso = new Date().toISOString();
-  db.prepare(
+  await db.prepare(
     `
     UPDATE flash_sales SET
       title = ?, subtitle = ?, badge_label = ?, target_category = ?, discount_pct = ?,
@@ -2860,7 +3096,7 @@ app.patch('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), (
     existing.id
   );
 
-  logAudit(
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2870,23 +3106,23 @@ app.patch('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), (
     `Updated flash sale "${nextTitle}" (${nextDiscount}% off ${nextCategory}, expires ${nextExpiresAt})`
   );
 
-  const row = db.prepare('SELECT * FROM flash_sales WHERE id = ?').get(existing.id) as Record<
+  const row = await db.prepare('SELECT * FROM flash_sales WHERE id = ?').get(existing.id) as Record<
     string,
     unknown
   >;
   res.json({ flashSale: mapFlashSaleRow(row) });
 });
 
-app.delete('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), (req: AuthenticatedRequest, res) => {
-  const existing = db.prepare('SELECT id, title, target_category FROM flash_sales WHERE id = ?').get(req.params.id) as
+app.delete('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), async (req: AuthenticatedRequest, res) => {
+  const existing = await db.prepare('SELECT id, title, target_category FROM flash_sales WHERE id = ?').get(req.params.id) as
     | { id: string; title: string; target_category: string }
     | undefined;
   if (!existing) {
     res.status(404).json({ error: 'Flash sale not found.' });
     return;
   }
-  db.prepare('DELETE FROM flash_sales WHERE id = ?').run(existing.id);
-  logAudit(
+  await db.prepare('DELETE FROM flash_sales WHERE id = ?').run(existing.id);
+  await logAudit(
     req.authUser!.id,
     req.authUser!.name,
     req.authUser!.roleName,
@@ -2901,6 +3137,7 @@ app.delete('/api/admin/flash-sales/:id', requirePermission('campaigns:manage'), 
 // ==================== SERVER STARTUP ====================
 
 async function startServer() {
+  await initDatabase();
   const port = Number(process.env.PORT || 3000);
   const isProd = process.env.NODE_ENV === 'production';
 
@@ -2924,7 +3161,7 @@ async function startServer() {
     }
 
     app.use(express.static(distDir, { maxAge: '1d' }));
-    app.get('*', (_req, res) => {
+    app.get('*', async (_req, res) => {
       const indexFile = path.join(distDir, 'index.html');
       if (fs.existsSync(indexFile)) {
         res.sendFile(indexFile);
@@ -2946,17 +3183,23 @@ async function startServer() {
     console.log(`Sam Brand Store listening on http://localhost:${port}`);
   });
 
+  let shuttingDown = false;
   function handleShutdown(signal: string) {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`\nReceived ${signal}. Shutting down cleanly...`);
-    server.close(() => {
-      try {
-        db.pragma('wal_checkpoint(TRUNCATE)');
-        db.close();
-        console.log('SQLite database closed cleanly.');
-      } catch (e) {
-        console.error('Error closing SQLite database:', e);
+    server.close(async (error) => {
+      if (error) {
+        console.error('Error closing HTTP server:', error);
+        process.exitCode = 1;
       }
-      process.exit(0);
+      try {
+        await db.close();
+        console.log('MySQL connection pool closed cleanly.');
+      } catch (error) {
+        console.error('Error closing MySQL connection pool:', error);
+        process.exitCode = 1;
+      }
     });
   }
 
@@ -2964,4 +3207,12 @@ async function startServer() {
   process.on('SIGINT', () => handleShutdown('SIGINT'));
 }
 
-startServer();
+startServer().catch(async (error) => {
+  console.error('Server startup failed:', error);
+  try {
+    await db.close();
+  } catch (closeError) {
+    console.error('Error closing MySQL connection pool after startup failure:', closeError);
+  }
+  process.exitCode = 1;
+});

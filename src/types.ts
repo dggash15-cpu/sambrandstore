@@ -62,7 +62,7 @@ export interface Product {
   slug: string;
   name: string;
   brand: string;
-  category: 'Consoles' | 'Monitors' | 'Audio' | 'Peripherals' | 'Accessories';
+  category: string;
   price: number;
   compareAtPrice: number | null;
   costPrice: number | null;
@@ -128,6 +128,20 @@ export interface RestockNotification {
   createdAt: string;
 }
 
+export interface StoreCategory {
+  id: string;
+  name: string;
+  slug: string;
+  subtitle: string;
+  imageUrl: string | null;
+  sortOrder: number;
+  active: boolean;
+  showInMenu: boolean;
+  menuLabel: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type CampaignPlacement = 'hero' | 'offer_strip' | 'banner_grid';
 export type CampaignTheme = 'navy' | 'cobalt' | 'obsidian' | 'chalk';
 export type CampaignSectionSize = 'full' | 'split' | 'compact';
@@ -153,13 +167,7 @@ export interface CampaignBanner {
 }
 
 export type FlashSaleTheme = 'crimson' | 'navy' | 'cobalt' | 'obsidian';
-export type FlashSaleCategory =
-  | 'All'
-  | 'Consoles'
-  | 'Monitors'
-  | 'Audio'
-  | 'Peripherals'
-  | 'Accessories';
+export type FlashSaleCategory = 'All' | (string & {});
 
 export interface FlashSale {
   id: string;

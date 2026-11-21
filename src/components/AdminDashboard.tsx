@@ -73,6 +73,7 @@ import {
   type ProductReview,
   type RestockNotification,
   type Role,
+  type StoreCategory,
 } from '../types';
 import { BrandLogo } from './BrandLogo';
 import { useTranslation, PRODUCT_AR_MAP } from '../lib/i18n';
@@ -85,14 +86,17 @@ interface AdminDashboardProps {
   onSwitchAccount: () => void;
   onLogout: () => void;
   onStoreSettingsChanged?: () => void;
+  onTabChange?: (tab: AdminTab) => void;
+  initialTab?: AdminTab;
 }
 
-type AdminTab =
+export type AdminTab =
   | 'overview'
   | 'analytics'
   | 'campaigns'
   | 'flash_sales'
   | 'catalog'
+  | 'categories'
   | 'orders'
   | 'rbac'
   | 'audit';
@@ -114,6 +118,8 @@ export function AdminDashboard({
   onSwitchAccount,
   onLogout,
   onStoreSettingsChanged,
+  onTabChange,
+  initialTab,
 }: AdminDashboardProps) {
   const {
     t,
@@ -127,7 +133,7 @@ export function AdminDashboard({
   } = useTranslation();
   const can = useCallback((p: PermissionKey) => user.permissions.includes(p), [user.permissions]);
 
-  const defaultTab: AdminTab = can('analytics:read')
+  const defaultTab: AdminTab = initialTab ?? (can('analytics:read')
     ? 'overview'
     : can('campaigns:manage')
     ? 'campaigns'
@@ -137,7 +143,7 @@ export function AdminDashboard({
     ? 'catalog'
     : can('staff:read') || can('roles:manage')
     ? 'rbac'
-    : 'audit';
+    : 'audit');
 
   const [activeTab, setActiveTab] = useState<AdminTab>(defaultTab);
   const [loading, setLoading] = useState(true);
@@ -154,6 +160,7 @@ export function AdminDashboard({
   > | null>(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<StoreCategory[]>([]);
   const [campaigns, setCampaigns] = useState<CampaignBanner[]>([]);
   const [flashSales, setFlashSales] = useState<FlashSale[]>([]);
   const [flashNowMs, setFlashNowMs] = useState(() => Date.now());
@@ -164,6 +171,12 @@ export function AdminDashboard({
   const [restockWaitlist, setRestockWaitlist] = useState<RestockNotification[]>([]);
   const [adminReviews, setAdminReviews] = useState<ProductReview[]>([]);
   const [adminReviewAvg, setAdminReviewAvg] = useState(0);
+  const [categoryEditing, setCategoryEditing] = useState<StoreCategory | null>(null);
+  const [categoryForm, setCategoryForm] = useState({ name: '', subtitle: '', imageUrl: '', sortOrder: 0, active: true, showInMenu: true, menuLabel: '' });
+
+  useEffect(() => {
+    onTabChange?.(activeTab);
+  }, [activeTab, onTabChange]);
 
   // Filters & Modals
   const [productSearch, setProductSearch] = useState('');
@@ -395,6 +408,7 @@ export function AdminDashboard({
       }
       if (can('products:read')) {
         tasks.push(api.getAdminProducts().then((r) => setProducts(r.products)));
+        tasks.push(api.getAdminCategories().then((r) => setCategories(r.categories)));
         tasks.push(api.getRestockWaitlist().then((r) => setRestockWaitlist(r.waitlist)));
         tasks.push(
           api.getAdminReviews().then((r) => {
@@ -429,6 +443,56 @@ export function AdminDashboard({
       setLoading(false);
     }
   }, [can, analyticsRange]);
+
+  const openCategoryForm = (category?: StoreCategory) => {
+    setCategoryEditing(category || null);
+    setCategoryForm({
+      name: category?.name || '',
+      subtitle: category?.subtitle || '',
+      imageUrl: category?.imageUrl || '',
+      sortOrder: category?.sortOrder || 0,
+      active: category?.active ?? true,
+      showInMenu: category?.showInMenu ?? true,
+      menuLabel: category?.menuLabel || category?.name || '',
+    });
+  };
+
+  const saveCategory = async () => {
+    try {
+      const payload = {
+        name: categoryForm.name,
+        subtitle: categoryForm.subtitle,
+        imageUrl: categoryForm.imageUrl || null,
+        sortOrder: Number(categoryForm.sortOrder),
+        active: categoryForm.active,
+        showInMenu: categoryForm.showInMenu,
+        menuLabel: categoryForm.menuLabel || categoryForm.name,
+      };
+      if (categoryEditing) {
+        await api.updateCategory(categoryEditing.id, payload);
+      } else {
+        await api.createCategory(payload);
+      }
+      notify(categoryEditing ? 'Category updated.' : 'Category created.');
+      openCategoryForm();
+      await loadWorkspaceData();
+      onCatalogChanged();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to save category.', true);
+    }
+  };
+
+  const deleteCategory = async (category: StoreCategory) => {
+    if (!window.confirm(`Delete category "${category.name}"?`)) return;
+    try {
+      await api.deleteCategory(category.id);
+      notify(`Deleted category "${category.name}".`);
+      await loadWorkspaceData();
+      onCatalogChanged();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to delete category.', true);
+    }
+  };
 
   useEffect(() => {
     loadWorkspaceData();
@@ -902,13 +966,7 @@ export function AdminDashboard({
     }
   };
 
-  const ALL_DEPARTMENTS: Product['category'][] = [
-    'Consoles',
-    'Monitors',
-    'Audio',
-    'Peripherals',
-    'Accessories',
-  ];
+  const ALL_DEPARTMENTS: string[] = categories.map((category) => category.name);
 
   const allowedProductCategories = ALL_DEPARTMENTS.filter(
     (cat) => user.departmentScope === 'all' || user.departmentScope.split(',').includes(cat)
@@ -918,7 +976,7 @@ export function AdminDashboard({
     user.departmentScope === 'all' || user.departmentScope.split(',').includes(cat);
 
   const CATEGORY_SPEC_TEMPLATES: Record<
-    Product['category'],
+    string,
     Array<{ key: string; value: string }>
   > = {
     Consoles: [
@@ -970,7 +1028,7 @@ export function AdminDashboard({
 
   // Product CRUD
   const openCreateProduct = () => {
-    const defaultCat = allowedProductCategories[0] || 'Peripherals';
+    const defaultCat = allowedProductCategories[0] || '';
     setProdForm({
       sku: `SBS-${defaultCat.slice(0, 3).toUpperCase()}-${Math.floor(100 + Math.random() * 900)}`,
       slug: '',
@@ -1004,7 +1062,7 @@ export function AdminDashboard({
       variants: ['Standard Edition'],
       whatsInBox: ['Main Hardware Unit', 'Braided USB-C Cable', '2-Year Warranty Card'],
       tags: [defaultCat.toLowerCase()],
-      specsList: CATEGORY_SPEC_TEMPLATES[defaultCat].map((r) => ({ ...r })),
+      specsList: (CATEGORY_SPEC_TEMPLATES[defaultCat] || []).map((r) => ({ ...r })),
       featured: false,
       active: true,
     });
@@ -1569,6 +1627,7 @@ export function AdminDashboard({
       allowed: can('campaigns:manage'),
     },
     { id: 'catalog', label: t('admin.navCatalog', 'Catalog & Stock'), icon: Package, allowed: can('products:read') },
+    { id: 'categories', label: 'Categories', icon: Layers, allowed: can('products:read') },
     { id: 'orders', label: t('admin.navOrders', 'Orders & Fulfillment'), icon: ShoppingCart, allowed: can('orders:read') },
     {
       id: 'rbac',
@@ -2010,7 +2069,7 @@ export function AdminDashboard({
                     {lang === 'ar' ? 'حركة المبيعات، توزيع الأقسام، ودوران المخزون' : 'Sales Velocity, Category Mix & Inventory Turnover'}
                   </h2>
                   <p className="mt-0.5 text-xs text-[#6B7A8D]">
-                    {lang === 'ar' ? 'بيانات وإحصائيات مباشرة وفورية لحركة الطلبات والمبيعات عبر فترات زمنية محددة.' : 'Live SQLite order & SKU movement telemetry across selectable time horizons.'}
+                    {lang === 'ar' ? 'بيانات وإحصائيات مباشرة وفورية لحركة الطلبات والمبيعات عبر فترات زمنية محددة.' : 'Live MySQL-backed order & SKU movement telemetry across selectable time horizons.'}
                   </p>
                 </div>
                 <div className="inline-flex items-center rounded-lg border border-[#E6ECF4] bg-[#F7FAFD] p-1">
@@ -2813,6 +2872,77 @@ export function AdminDashboard({
           )}
 
           {/* TAB 2: CATALOG & RESTOCK WAITLIST */}
+          {activeTab === 'categories' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="font-display text-lg font-bold text-[#0F1B2D]">Store Categories</h2>
+                  <p className="mt-1 text-xs text-[#6B7A8D]">Create, reorder, update images, and remove catalog categories.</p>
+                </div>
+                <button type="button" onClick={() => openCategoryForm()} className="inline-flex items-center gap-2 rounded-lg bg-[#1180E1] px-3 py-2 text-xs font-semibold text-white cursor-pointer">
+                  <Plus className="h-4 w-4" /> Add Category
+                </button>
+              </div>
+
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
+                <div className="overflow-hidden rounded-xl border border-[#E6ECF4] bg-white">
+                  {categories.map((category) => (
+                    <div key={category.id} className="flex items-center gap-3 border-b border-[#EDF2F7] p-3 last:border-b-0">
+                      <div className="h-12 w-12 overflow-hidden rounded-lg bg-[#F1F5F9]">
+                        {category.imageUrl && <img src={category.imageUrl} alt="" className="h-full w-full object-cover" />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-bold text-[#0F1B2D]">{category.name}</p>
+                        <p className="truncate text-xs text-[#6B7A8D]">{category.subtitle || 'No subtitle'}</p>
+                      </div>
+                      <span className={`rounded-full px-2 py-1 text-[10px] font-bold ${category.active ? 'bg-[#DCFCE7] text-[#166534]' : 'bg-[#F1F5F9] text-[#64748B]'}`}>
+                        {category.active ? 'Active' : 'Hidden'}
+                      </span>
+                      <button type="button" onClick={() => openCategoryForm(category)} className="rounded-lg border border-[#D4DFEE] p-2 text-[#475569] cursor-pointer" aria-label={`Edit ${category.name}`}><Pencil className="h-4 w-4" /></button>
+                      <button type="button" onClick={() => deleteCategory(category)} className="rounded-lg border border-[#FECACA] p-2 text-[#DC2626] cursor-pointer" aria-label={`Delete ${category.name}`}><Trash2 className="h-4 w-4" /></button>
+                    </div>
+                  ))}
+                  {categories.length === 0 && <div className="p-8 text-center text-sm text-[#6B7A8D]">No categories yet. Add the first category to start building the catalog.</div>}
+                </div>
+
+                <div className="rounded-xl border border-[#E6ECF4] bg-white p-4">
+                  <h3 className="font-display text-sm font-bold text-[#0F1B2D]">{categoryEditing ? 'Edit Category' : 'New Category'}</h3>
+                  <div className="mt-3 space-y-3">
+                    <input value={categoryForm.name} onChange={(e) => setCategoryForm((p) => ({ ...p, name: e.target.value }))} placeholder="Category name" className="w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm" />
+                    <input value={categoryForm.menuLabel} onChange={(e) => setCategoryForm((p) => ({ ...p, menuLabel: e.target.value }))} placeholder="Main menu label" className="w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm" />
+                    <input value={categoryForm.subtitle} onChange={(e) => setCategoryForm((p) => ({ ...p, subtitle: e.target.value }))} placeholder="Subtitle" className="w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm" />
+                    <input value={categoryForm.imageUrl} onChange={(e) => setCategoryForm((p) => ({ ...p, imageUrl: e.target.value }))} placeholder="Image URL" className="w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm" />
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={async (event) => {
+                        const file = event.target.files?.[0];
+                        if (!file) return;
+                        const reader = new FileReader();
+                        reader.onload = async () => {
+                          try {
+                            const uploaded = await api.uploadImage(String(reader.result), file.name);
+                            setCategoryForm((previous) => ({ ...previous, imageUrl: uploaded.url }));
+                          } catch (error) {
+                            notify(error instanceof Error ? error.message : 'Unable to upload category image.', true);
+                          }
+                        };
+                        reader.readAsDataURL(file);
+                      }}
+                      className="w-full text-xs text-[#64748B]"
+                    />
+                    <input type="number" value={categoryForm.sortOrder} onChange={(e) => setCategoryForm((p) => ({ ...p, sortOrder: Number(e.target.value) }))} placeholder="Sort order" className="w-full rounded-lg border border-[#D4DFEE] px-3 py-2 text-sm" />
+                    <label className="flex items-center gap-2 text-xs text-[#475569]"><input type="checkbox" checked={categoryForm.active} onChange={(e) => setCategoryForm((p) => ({ ...p, active: e.target.checked }))} /> Active</label>
+                    <label className="flex items-center gap-2 text-xs text-[#475569]"><input type="checkbox" checked={categoryForm.showInMenu} onChange={(e) => setCategoryForm((p) => ({ ...p, showInMenu: e.target.checked }))} /> Show in main menu</label>
+                    <button type="button" onClick={saveCategory} disabled={!categoryForm.name.trim()} className="w-full rounded-lg bg-[#0F1B2D] px-3 py-2 text-xs font-semibold text-white disabled:opacity-40 cursor-pointer">
+                      {categoryEditing ? 'Save Changes' : 'Create Category'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {activeTab === 'catalog' && (
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -5264,11 +5394,9 @@ export function AdminDashboard({
                     className="mt-1 w-full rounded-lg border border-[#D4DFEE] px-3 py-2"
                   >
                     <option value="All">All</option>
-                    <option value="Consoles">Consoles</option>
-                    <option value="Monitors">Monitors</option>
-                    <option value="Audio">Audio</option>
-                    <option value="Peripherals">Peripherals</option>
-                    <option value="Accessories">Accessories</option>
+                    {allowedProductCategories.map((category) => (
+                      <option key={category} value={category}>{category}</option>
+                    ))}
                   </select>
                 </div>
                 <div>
@@ -5485,11 +5613,9 @@ export function AdminDashboard({
                       }
                       className="mt-1 w-full rounded-lg border border-[#D4DFEE] bg-white px-3 py-2 focus:border-[#1180E1] focus:outline-none"
                     >
-                      <option value="Monitors">Monitors</option>
-                      <option value="Consoles">Consoles</option>
-                      <option value="Audio">Audio</option>
-                      <option value="Peripherals">Peripherals</option>
-                      <option value="Accessories">Accessories</option>
+                      {allowedProductCategories.map((category) => (
+                        <option key={category} value={category}>{category}</option>
+                      ))}
                       <option value="All">All Categories</option>
                     </select>
                   </div>

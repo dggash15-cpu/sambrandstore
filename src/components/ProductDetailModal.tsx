@@ -3,6 +3,8 @@ import { AnimatePresence, motion } from 'motion/react';
 import {
   X,
   ShoppingBag,
+  Minus,
+  Plus,
   ShieldCheck,
   Truck,
   Check,
@@ -21,7 +23,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { api } from '../lib/api';
-import type { Product, ProductRatingSummary, ProductReview } from '../types';
+import type { CartItem, Product, ProductRatingSummary, ProductReview } from '../types';
 import { ProductVisual } from './ProductVisual';
 import { formatCountdownParts } from './FlashSaleBanner';
 import { useTranslation } from '../lib/i18n';
@@ -30,6 +32,8 @@ interface ProductDetailModalProps {
   product: Product | null;
   onClose: () => void;
   onAddToCart: (product: Product, variant: string, openDrawer?: boolean) => void;
+  cartItems?: CartItem[];
+  onUpdateCartQty?: (productId: string, variant: string, delta: number) => void;
   isFavorite?: boolean;
   onToggleFavorite?: (productId: string) => void;
   isCompared?: boolean;
@@ -78,6 +82,8 @@ export function ProductDetailModal({
   product,
   onClose,
   onAddToCart,
+  cartItems = [],
+  onUpdateCartQty,
   isFavorite = false,
   onToggleFavorite,
   isCompared = false,
@@ -146,6 +152,12 @@ export function ProductDetailModal({
       : [];
     return Array.from(new Set(list.filter(Boolean)));
   }, [product]);
+
+  const cartQuantity = product
+    ? cartItems
+        .filter((item) => item.product.id === product.id && item.variant === selectedVariant)
+        .reduce((sum, item) => sum + item.quantity, 0)
+    : 0;
 
   useEffect(() => {
     if (product) {
@@ -326,7 +338,7 @@ export function ProductDetailModal({
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.97, y: 12 }}
             transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-            className="relative z-10 max-h-[92vh] w-full max-w-4xl overflow-y-auto rounded-2xl border border-[#E6ECF4] bg-white shadow-2xl"
+            className="relative z-10 max-h-[94vh] w-[calc(100%-1rem)] max-w-4xl overflow-y-auto rounded-2xl border border-[#E6ECF4] bg-white shadow-2xl sm:w-full"
           >
             <button
               type="button"
@@ -339,7 +351,7 @@ export function ProductDetailModal({
 
             <div className="grid grid-cols-1 md:grid-cols-12">
               {/* Left Multi-Image Gallery */}
-              <div className="flex flex-col justify-between border-b border-[#E6ECF4] bg-[#F7FAFD] p-6 md:col-span-6 md:border-b-0 md:border-r">
+              <div className="flex flex-col justify-between border-b border-[#E6ECF4] bg-[#F7FAFD] p-4 sm:p-6 md:col-span-6 md:border-b-0 md:border-r">
                 <div>
                   <div
                     onMouseEnter={() => setIsHoveringImage(true)}
@@ -522,7 +534,7 @@ export function ProductDetailModal({
               </div>
 
               {/* Right Contiguous Purchase Module */}
-              <div className={`flex flex-col justify-between p-6 md:col-span-6 md:p-8 ${isRtl ? 'text-right' : 'text-left'}`}>
+              <div className={`flex flex-col justify-between p-4 sm:p-6 md:col-span-6 md:p-8 ${isRtl ? 'text-right' : 'text-left'}`}>
                 <div>
                   <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-[#6B7A8D]">
                     <span className="uppercase tracking-wider">{product.brand}</span>
@@ -670,7 +682,7 @@ export function ProductDetailModal({
                   {isOutOfStock ? (
                     <div className="space-y-3">
                       {!notifyFormOpen && !notifySuccess && (
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
                           {onToggleFavorite && (
                             <button
                               type="button"
@@ -796,26 +808,52 @@ export function ProductDetailModal({
                         </button>
                       )}
 
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onAddToCart(product, selectedVariant, false);
-                          setAdded(true);
-                          setTimeout(() => setAdded(false), 1400);
-                        }}
-                        className={`flex-1 inline-flex items-center justify-center gap-2 rounded-lg px-4 py-3 text-xs font-semibold transition-all cursor-pointer ${
-                          added
-                            ? 'bg-[#16A34A] text-white'
-                            : 'border border-[#D4DFEE] bg-[#F7FAFD] text-[#0F1B2D] hover:bg-[#E6ECF4]'
-                        }`}
-                      >
-                        {added ? <Check className="h-4 w-4" /> : <ShoppingBag className="h-4 w-4" />}
-                        <span>
-                          {added
-                            ? (lang === 'ar' ? 'تمت الإضافة للسلة' : 'Added to Bag')
-                            : (lang === 'ar' ? 'إضافة للسلة' : 'Add to Cart')}
-                        </span>
-                      </button>
+                      {cartQuantity > 0 ? (
+                        <div className="order-first flex basis-full flex-col gap-1.5 sm:order-none sm:basis-auto sm:flex-1">
+                          <span className="text-xs font-medium text-[#475569] sm:text-sm">
+                            {lang === 'ar' ? 'الكمية' : 'Quantity'}
+                          </span>
+                          <div className="flex h-11 w-full items-center justify-between rounded-full border border-[#C9D7EA] bg-white px-3 text-[#0F1B2D] shadow-[0_5px_14px_rgba(15,27,45,0.08)] sm:h-12 sm:min-w-[180px] sm:px-4">
+                            <button
+                              type="button"
+                              onClick={() => onUpdateCartQty?.(product.id, selectedVariant, -1)}
+                              className="flex h-10 w-10 items-center justify-center rounded-full text-[#0F1B2D] transition-colors hover:bg-[#F1F5F9] cursor-pointer"
+                              aria-label="Decrease quantity"
+                            >
+                              <Minus className="h-5 w-5" strokeWidth={1.8} />
+                            </button>
+                            <span className="min-w-10 text-center font-serif text-xl font-semibold text-[#1180E1]">
+                              {cartQuantity}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => onUpdateCartQty?.(product.id, selectedVariant, 1)}
+                              disabled={cartQuantity >= product.stock}
+                              className="flex h-10 w-10 items-center justify-center rounded-full text-[#0F1B2D] transition-colors hover:bg-[#F1F5F9] disabled:opacity-40 cursor-pointer"
+                              aria-label="Increase quantity"
+                            >
+                              <Plus className="h-5 w-5" strokeWidth={1.8} />
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onAddToCart(product, selectedVariant, false);
+                            setAdded(true);
+                            setTimeout(() => setAdded(false), 1400);
+                          }}
+                          className={`flex-1 inline-flex items-center justify-center gap-2 rounded-lg px-4 py-3 text-xs font-semibold transition-all cursor-pointer ${
+                            added
+                              ? 'bg-[#16A34A] text-white'
+                              : 'border border-[#D4DFEE] bg-[#F7FAFD] text-[#0F1B2D] hover:bg-[#E6ECF4]'
+                          }`}
+                        >
+                          {added ? <Check className="h-4 w-4" /> : <ShoppingBag className="h-4 w-4" />}
+                          <span>{added ? (lang === 'ar' ? 'تمت الإضافة للسلة' : 'Added to Bag') : (lang === 'ar' ? 'إضافة للسلة' : 'Add to Cart')}</span>
+                        </button>
+                      )}
 
                       <button
                         type="button"

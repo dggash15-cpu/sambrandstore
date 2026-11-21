@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import { Clock, History, Search, Receipt, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
-import type { Product } from '../types';
+import type { Product, StoreCategory } from '../types';
 import type { LocalOrderSnapshot, VisitorLogEntry, VisitorMeta } from '../lib/visitorHistory';
 import { BrandLogo } from './BrandLogo';
 import { ProductVisual } from './ProductVisual';
 import { useTranslation } from '../lib/i18n.tsx';
 
 interface FooterProps {
+  categories: StoreCategory[];
   onSelectCategory: (cat: string) => void;
   onOpenTracker: () => void;
   recentlyViewed: Product[];
@@ -25,6 +26,7 @@ interface FooterProps {
 }
 
 export function Footer({
+  categories,
   onSelectCategory,
   onOpenTracker,
   recentlyViewed,
@@ -239,19 +241,19 @@ export function Footer({
         </div>
 
         <div className="md:col-span-3 space-y-2 text-xs">
-          <p className="font-semibold uppercase tracking-wider text-[#94A3B8]">{t('cat.all')}</p>
+          <p className="font-semibold uppercase tracking-wider text-[#94A3B8]">Categories</p>
           <ul className="space-y-1.5 text-[#CBD5E1]">
-            {['Consoles', 'Monitors', 'Audio', 'Peripherals', 'Accessories'].map((cat) => (
-              <li key={cat}>
+            {categories.map((category) => (
+              <li key={category.id}>
                 <button
                   type="button"
                   onClick={() => {
-                    onSelectCategory(cat);
+                    onSelectCategory(category.name);
                     document.getElementById('catalog-section')?.scrollIntoView({ behavior: 'smooth' });
                   }}
                   className="hover:text-[#3C9BF0] transition-colors cursor-pointer"
                 >
-                  {translateCategory(cat)}
+                  {translateCategory(category.name)}
                 </button>
               </li>
             ))}

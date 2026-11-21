@@ -52,12 +52,12 @@ A full-stack, production-ready e-commerce storefront and admin platform for **Sa
 | Storefront mobile drawer | Drawer bottom → `Sign Out` button |
 
 ### Security
-- JWT + cookie session auth with brute-force rate limiting (429 after ~14 attempts, 15-min cooldown)
+- JWT + cookie session auth with brute-force rate limiting; password reset requests are limited to 5 per IP per hour
+- Staff password reset codes are HMAC-hashed in MariaDB, expire after 15 minutes, and are emailed through configured SMTP
 - RBAC permission boundaries enforced at API layer (403 on violations)
 - Security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`
 - Proxy trust configured for Hostinger reverse proxy (SSL cookies)
-- WAL checkpoint on `SIGTERM` / `SIGINT` to protect SQLite integrity
-- `demoVerificationCode` suppressed in `NODE_ENV=production`
+- MySQL connection pool closes on `SIGTERM` / `SIGINT`
 
 ---
 
@@ -69,8 +69,8 @@ A full-stack, production-ready e-commerce storefront and admin platform for **Sa
 | Animations | Motion (Framer Motion v12) |
 | Charts | Recharts |
 | Icons | Lucide React |
-| Backend | Express 4, TypeScript, Node.js 20+ |
-| Database | SQLite (better-sqlite3) with WAL mode |
+| Backend | Express 4, TypeScript, Node.js 20+, Nodemailer |
+| Database | MariaDB/MySQL (`mysql2`) |
 | Bundler | Vite (client) + esbuild (server) |
 | Fonts | Outfit (UI), Cairo (Arabic) |
 
@@ -100,9 +100,16 @@ Edit `.env` with your values:
 NODE_ENV=development
 PORT=3000
 SESSION_SECRET=your-32-char-random-secret-here
-DB_PATH=./data/sam_brand_store.db
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=your_database_user
+DB_NAME=your_database_name
+DB_PASSWORD=your_database_password
 STORE_WHATSAPP_NUMBER=96171972495
 ```
+
+Use a dedicated local development database. The application creates its schema on startup.
+The legacy SQLite file, if present, is not read, imported, or deleted by the app.
 
 ### 3. Run development server
 ```bash
@@ -111,7 +118,7 @@ npm run dev
 
 The app will be available at **http://localhost:3000**
 
-> The database is auto-created and seeded with products, campaigns, reviews, and staff accounts on first run.
+> Development runs seed sample catalog data and staff accounts. Production does not seed sample orders or reviews.
 
 ---
 
@@ -119,16 +126,10 @@ The app will be available at **http://localhost:3000**
 
 Navigate to **`/sbs-admin`** or press **`Alt + Shift + A`** anywhere on the site.
 
-### Default Staff Accounts
-
-| Name | Role | Email | Password |
-|------|------|-------|----------|
-| **Sam Vance** | Store Owner (Full Access) | `sam@sambrandstore.com` | `SamAdmin2026!` |
-| **Maya Lin** | Operations Manager | `maya.ops@sambrandstore.com` | `MayaOps2026!` |
-| **Alex Rivera** | Inventory Specialist | `alex.stock@sambrandstore.com` | `AlexStock2026!` |
-| **Liam Patel** | Fulfillment Specialist | `liam.ship@sambrandstore.com` | `LiamShip2026!` |
-
-> ⚠️ **Change all passwords immediately after your first production login** via Admin → Account → Reset Password.
+In production, the initial owner account is created from the `ADMIN_EMAIL` and
+`ADMIN_PASSWORD` environment variables. Set a unique password of at least 16 characters
+in Hostinger before the first launch. Production does not create the development-only
+staff accounts; add staff from the admin dashboard after signing in.
 
 ---
 
@@ -155,39 +156,18 @@ npm start
 npm run test:e2e
 ```
 
-Runs **28 automated checks** against a live production build:
-
-| Group | Checks |
-|-------|--------|
-| Database & Persistence Integrity | 4 |
-| Production Server Boot & HTTP Health | 3 |
-| Product Catalog & Search | 2 |
-| Customer Reviews (SQLite Persistent) | 3 |
-| Restock Notification Subscriber | 2 |
-| Campaigns & Flash Sales | 2 |
-| Guest Checkout & Order Tracking | 2 |
-| Staff Authentication & RBAC Boundaries | 6 |
-| Static Assets & SPA Routing | 3 |
-| Security: Rate Limiting Defense | 1 |
-
-**Latest result:** 🟢 `28/28 PASSED — 100% PRODUCTION READY`
+The suite requires an isolated MySQL database. Set `TEST_DB_HOST`, `TEST_DB_PORT`,
+`TEST_DB_USER`, `TEST_DB_PASSWORD`, and `TEST_DB_NAME` (the database name must end in
+`_test` or `_e2e`). It refuses to use the normal `DB_*` settings. It writes test data,
+including an order, only to that dedicated test database.
 
 ---
 
 ## 💾 Database Backup
 
-```bash
-npm run backup
-```
-
-Creates a timestamped copy of the SQLite database in `./backups/`:
-```
-backups/backup-2026-11-19_17-30-00.db
-```
-
-- Copies WAL (`-wal`) and SHM (`-shm`) files automatically
-- Auto-purges backups older than **30 days**
-- Schedule on Hostinger cron: `0 3 * * *` (daily at 3 AM)
+Use Hostinger's database backup/export tools in hPanel or phpMyAdmin before schema
+changes or data cleanup. The former SQLite backup script has been removed because the
+application now uses MariaDB/MySQL.
 
 ---
 
@@ -218,16 +198,13 @@ sam-brand-store/
 │   ├── types.ts                # Shared TypeScript type definitions
 │   └── main.tsx                # React entry point
 ├── server/
-│   └── db.ts                   # SQLite schema, migrations, seed data
+│   └── db.ts                   # MariaDB schema, seed data, query helpers
 ├── server.ts                   # Express API server (all routes)
-├── scripts/
-│   └── backup-sqlite.ts        # Daily backup + retention script
 ├── data/
-│   └── sam_brand_store.db      # SQLite database (auto-created)
-├── backups/                    # Timestamped DB backups
+│   └── sam_brand_store.db      # Legacy SQLite data, not used by the app
 ├── uploads/                    # Uploaded product/logo images
 ├── dist/                       # Production build output
-├── test-e2e.ts                 # End-to-end test suite (28 checks)
+├── test-e2e.ts                 # End-to-end test suite (isolated test DB only)
 ├── DEPLOYMENT_GUIDE.md         # Hostinger deployment instructions
 ├── .env.example                # Environment variable template
 └── package.json
@@ -279,7 +256,7 @@ See [`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md) for the complete step-by-step
 4. Configure environment variables (especially `SESSION_SECRET`)
 5. Run `npm ci && npm run build`
 6. Click **Start** in hPanel
-7. Set up daily backup cron: `0 3 * * * cd /home/user/sam-brand-store && npm run backup`
+7. Verify database backups are enabled in Hostinger hPanel.
 
 ---
 
@@ -289,7 +266,8 @@ See [`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md) for the complete step-by-step
 - Login endpoint rate-limited: **429** after ~14 failed attempts, **15-minute** cooldown
 - Password hashing uses Node.js `crypto.scryptSync` with a unique salt
 - Never commit `.env` to version control — use `.env.example` as the template
-- SQLite database (`data/`) and uploads (`uploads/`) directories should not be web-accessible directly (Express handles serving with authentication where needed)
+- Keep database credentials in Hostinger environment variables and never commit them
+- The legacy SQLite file is not connected to the application; do not delete it until reviewed and backed up
 
 ---
 

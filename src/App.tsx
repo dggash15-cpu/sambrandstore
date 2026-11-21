@@ -24,6 +24,7 @@ import type {
   Order,
   Product,
   ProductReview,
+  StoreCategory,
 } from './types';
 import { Navbar } from './components/Navbar';
 import { HeroSection } from './components/HeroSection';
@@ -43,6 +44,7 @@ const AdminDashboard = lazy(() =>
 import { MessageCircle } from 'lucide-react';
 import { Footer } from './components/Footer';
 import { useTranslation } from './lib/i18n';
+import type { AdminTab } from './components/AdminDashboard';
 
 const CART_STORAGE_KEY = 'sbs_shopping_bag';
 const FAVORITES_STORAGE_KEY = 'sbs_favorites';
@@ -61,11 +63,34 @@ function isHiddenAdminRoute(): boolean {
   );
 }
 
+function pushAppRoute(path: string): void {
+  if (window.location.pathname !== path) {
+    window.history.pushState(null, '', path);
+  }
+}
+
+function restoreRouteFromLocation(): void {
+  const path = window.location.pathname;
+  if (path.startsWith('/sbs-admin')) return;
+  if (path === '/cart') return;
+  if (path === '/favorites') return;
+  if (path.startsWith('/category/')) return;
+  if (path.startsWith('/product/')) return;
+}
+
+function getAdminTabFromLocation(): AdminTab | undefined {
+  const match = window.location.pathname.match(/^\/sbs-admin\/([a-z_]+)/);
+  const tab = match?.[1];
+  const valid: AdminTab[] = ['overview','analytics','campaigns','flash_sales','catalog','categories','orders','rbac','audit'];
+  return valid.includes(tab as AdminTab) ? (tab as AdminTab) : undefined;
+}
+
 export default function App() {
   const { lang, t, translateProduct, translateProducts } = useTranslation();
   const [products, setProducts] = useState<Product[]>([]);
   const [campaigns, setCampaigns] = useState<CampaignBanner[]>([]);
   const [flashSales, setFlashSales] = useState<FlashSale[]>([]);
+  const [categories, setCategories] = useState<StoreCategory[]>([]);
   const [loadingProducts, setLoadingProducts] = useState(true);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [activeView, setActiveView] = useState<'storefront' | 'admin'>('storefront');
@@ -158,6 +183,10 @@ export default function App() {
 
   // Record session visit on mount and sync persistent browser metadata
   useEffect(() => {
+    if (window.location.pathname === '/cart') setCartOpen(true);
+  }, []);
+
+  useEffect(() => {
     const { meta, entries } = recordBrowserSessionVisit();
     setVisitorMeta(meta);
     setVisitorLog(entries);
@@ -212,6 +241,8 @@ export default function App() {
 
   const handleSelectCategory = useCallback((category: string) => {
     setSelectedCategory(category);
+    const categorySlug = categories.find((item) => item.name === category)?.slug || 'all';
+    pushAppRoute(categorySlug === 'all' ? '/' : `/category/${categorySlug}`);
     const meta = saveVisitorMeta({ lastCategory: category, lastVisitAt: new Date().toISOString() });
     setVisitorMeta(meta);
     const nextLog = appendVisitorLog({
@@ -316,6 +347,12 @@ export default function App() {
     try {
       const res = await api.getProducts();
       setProducts(res.products);
+      const productMatch = window.location.pathname.match(/^\/product\/([^/]+)/);
+      if (productMatch) {
+        const routeKey = decodeURIComponent(productMatch[1]);
+        const routeProduct = res.products.find((item) => item.slug === routeKey || item.id === routeKey);
+        if (routeProduct) setSelectedProduct(routeProduct);
+      }
       setSelectedProduct((prev) =>
         prev ? res.products.find((p) => p.id === prev.id) || prev : null
       );
@@ -375,8 +412,23 @@ export default function App() {
     }
   }, []);
 
+  const fetchCategories = useCallback(async () => {
+    try {
+      const res = await api.getCategories();
+      setCategories(res.categories);
+      const categoryMatch = window.location.pathname.match(/^\/category\/([^/]+)/);
+      if (categoryMatch) {
+        const category = res.categories.find((item) => item.slug === decodeURIComponent(categoryMatch[1]));
+        if (category) setSelectedCategory(category.name);
+      }
+    } catch (err) {
+      console.error('Failed to fetch categories:', err);
+    }
+  }, []);
+
   const handleFlashSaleExpired = useCallback(() => {
     fetchFlashSales();
+    fetchCategories();
     fetchProducts();
   }, [fetchFlashSales, fetchProducts]);
 
@@ -405,7 +457,7 @@ export default function App() {
           setAuthOpen(true);
         }
       });
-  }, [fetchProducts, fetchCampaigns, fetchFlashSales]);
+  }, [fetchProducts, fetchCampaigns, fetchFlashSales, fetchCategories, fetchStoreSettings]);
 
   // Hidden Admin Login routing (/sbs-admin, #sbs-admin, #admin, or Alt+Shift+A) — never shown to regular shoppers
   useEffect(() => {
@@ -415,6 +467,12 @@ export default function App() {
           setActiveView('admin');
         } else {
           setAuthOpen(true);
+        }
+      } else {
+        setActiveView('storefront');
+        setCartOpen(window.location.pathname === '/cart');
+        if (!window.location.pathname.startsWith('/product/')) {
+          setSelectedProduct(null);
         }
       }
     };
@@ -441,6 +499,7 @@ export default function App() {
 
   const handleInspectProduct = useCallback((product: Product) => {
     setSelectedProduct(product);
+    pushAppRoute(`/product/${product.slug || product.id}`);
     setRecentlyViewedIds((prev) =>
       [product.id, ...prev.filter((id) => id !== product.id)].slice(0, 5)
     );
@@ -679,6 +738,7 @@ export default function App() {
       )}
 
       <Navbar
+        categories={categories}
         activeView={activeView}
         onNavigateView={(view) => {
           if (view === 'admin' && (!user || user.roleSlug === 'customer')) {
@@ -686,12 +746,16 @@ export default function App() {
             return;
           }
           setActiveView(view);
+          pushAppRoute(view === 'admin' ? '/sbs-admin/overview' : '/');
         }}
         selectedCategory={selectedCategory}
         onSelectCategory={handleSelectCategory}
         cartCount={cartCount}
         favoritesCount={favorites.length}
-        onOpenCart={() => setCartOpen(true)}
+        onOpenCart={() => {
+          setCartOpen(true);
+          pushAppRoute('/cart');
+        }}
         onOpenFavorites={() => setFavoritesOpen(true)}
         products={localizedProducts}
         onSelectProduct={handleInspectProduct}
@@ -727,11 +791,10 @@ export default function App() {
             >
               <AdminDashboard
                 user={user}
+                initialTab={getAdminTabFromLocation()}
                 onBackToStore={() => {
                   setActiveView('storefront');
-                  if (isHiddenAdminRoute()) {
-                    window.history.replaceState(null, '', '/');
-                  }
+                  pushAppRoute('/');
                 }}
                 onCatalogChanged={fetchProducts}
                 onCampaignsChanged={() => {
@@ -741,6 +804,7 @@ export default function App() {
                 onSwitchAccount={() => setAuthOpen(true)}
                 onLogout={handleLogout}
                 onStoreSettingsChanged={fetchStoreSettings}
+                onTabChange={(tab) => pushAppRoute(`/sbs-admin/${tab}`)}
               />
             </Suspense>
           </motion.div>
@@ -775,6 +839,7 @@ export default function App() {
 
             <CategoryStrip
               products={localizedProducts}
+              categories={categories}
               selectedCategory={selectedCategory}
               onSelectCategory={handleSelectCategory}
             />
@@ -795,6 +860,7 @@ export default function App() {
             ) : (
               <CatalogSection
                 products={localizedProducts}
+                categories={categories}
                 selectedCategory={selectedCategory}
                 onSelectCategory={handleSelectCategory}
                 onSelectProduct={handleInspectProduct}
@@ -814,6 +880,7 @@ export default function App() {
             <SectionDivider variant="catalog-to-footer" />
 
             <Footer
+              categories={categories}
               onSelectCategory={handleSelectCategory}
               onOpenTracker={() => {
                 setTrackerPreset(null);
@@ -864,8 +931,13 @@ export default function App() {
       {/* Modals & Drawers */}
       <ProductDetailModal
         product={localizedSelectedProduct}
-        onClose={() => setSelectedProduct(null)}
+        onClose={() => {
+          setSelectedProduct(null);
+          pushAppRoute('/');
+        }}
         onAddToCart={handleAddToCart}
+        cartItems={cart}
+        onUpdateCartQty={handleUpdateQty}
         isFavorite={selectedProduct ? favorites.includes(selectedProduct.id) : false}
         onToggleFavorite={toggleFavorite}
         isCompared={selectedProduct ? compareIds.includes(selectedProduct.id) : false}
@@ -909,7 +981,10 @@ export default function App() {
 
       <CartCheckoutDrawer
         open={cartOpen}
-        onClose={() => setCartOpen(false)}
+        onClose={() => {
+          setCartOpen(false);
+          pushAppRoute('/');
+        }}
         items={localizedCart}
         onUpdateQty={handleUpdateQty}
         onRemoveItem={handleRemoveItem}

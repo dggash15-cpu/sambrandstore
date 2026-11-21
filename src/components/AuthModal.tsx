@@ -50,7 +50,6 @@ export function AuthModal({
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [codeRequested, setCodeRequested] = useState(false);
-  const [devCodeHint, setDevCodeHint] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,7 +68,6 @@ export function AuthModal({
       setNewPassword('');
       setConfirmNewPassword('');
       setCodeRequested(false);
-      setDevCodeHint(null);
       setShowProfileChangePw(false);
     }
   }, [open]);
@@ -103,7 +101,6 @@ export function AuthModal({
     try {
       const res = await api.requestPasswordReset(target);
       setCodeRequested(true);
-      setDevCodeHint(res.demoVerificationCode || null);
       setSuccessMsg(res.message);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to request reset code.');
@@ -142,7 +139,6 @@ export function AuthModal({
       setNewPassword('');
       setConfirmNewPassword('');
       setCodeRequested(false);
-      setDevCodeHint(null);
 
       if (!user) {
         setEmail(targetEmail);
@@ -497,11 +493,6 @@ export function AuthModal({
                   {successMsg && (
                     <div className="mt-3 rounded-lg border border-[#BBF7D0] bg-[#F0FDF4] p-2.5 text-xs font-medium text-[#166534]">
                       <p>{successMsg}</p>
-                      {devCodeHint && (
-                        <p className="mt-1 font-mono font-bold text-[#0F1B2D]">
-                          {lang === 'ar' ? 'رمز التحقق:' : 'Verification Code:'} {devCodeHint}
-                        </p>
-                      )}
                     </div>
                   )}
 
